@@ -8,8 +8,9 @@ Validates the dataclass invariants and exercises the interface against a
 backends are tested manually with a launched training script (see README).
 """
 
+from dataclasses import replace
+
 import pytest
-import torch
 
 import deepspeed.runtime.rollout as rollout_module
 from deepspeed.runtime.rollout import (
@@ -19,38 +20,24 @@ from deepspeed.runtime.rollout import (
     SamplingConfig,
     build_rollout,
 )
+from deepspeed.runtime.rollout.base import Sample
 
 # --- dataclass invariants ---------------------------------------------------
 
 
 def test_rollout_request_validates_shapes():
-    with pytest.raises(ValueError, match="must be 2-D"):
-        RolloutRequest(prompt_ids=torch.zeros(8), prompt_attention_mask=torch.ones(8))
+    RolloutRequest(samples=[Sample(prompt="not tokenized yet")])
     with pytest.raises(ValueError, match="does not match"):
-        RolloutRequest(prompt_ids=torch.zeros(2, 4, dtype=torch.long), prompt_attention_mask=torch.ones(2, 5))
+        RolloutRequest(samples=[Sample(tokens=[1, 2, 3], attention_mask=[1, 1])])
 
 
 def test_rollout_batch_validates_shapes():
-    with pytest.raises(ValueError, match="must be 2-D"):
-        RolloutBatch(input_ids=torch.zeros(8, dtype=torch.long),
-                     attention_mask=torch.ones(8),
-                     response_start_idx=torch.tensor([4]))
     with pytest.raises(ValueError, match="does not match"):
-        RolloutBatch(input_ids=torch.zeros(2, 4, dtype=torch.long),
-                     attention_mask=torch.ones(2, 5),
-                     response_start_idx=torch.tensor([4, 4]))
-    with pytest.raises(ValueError, match="1-D of length"):
-        RolloutBatch(input_ids=torch.zeros(2, 4, dtype=torch.long),
-                     attention_mask=torch.ones(2, 4),
-                     response_start_idx=torch.tensor([4]))
+        RolloutBatch(samples=[Sample(tokens=[1, 2], attention_mask=[1, 1]), Sample(tokens=[1, 2], attention_mask=[1])])
 
 
 def test_rollout_batch_accessors():
-    batch = RolloutBatch(
-        input_ids=torch.zeros(3, 12, dtype=torch.long),
-        attention_mask=torch.ones(3, 12),
-        response_start_idx=torch.tensor([4, 5, 6]),
-    )
+    batch = RolloutBatch(samples=[Sample(tokens=[1] * length, attention_mask=[1] * length) for length in (4, 12, 7)])
     assert batch.batch_size == 3
     assert batch.seq_len == 12
 
@@ -74,7 +61,7 @@ def test_continuous_batching_details_are_not_public_exports():
 
 
 class FakeRollout(RolloutEngine):
-    """Deterministic stub: appends ``[42] * max_new_tokens`` to each prompt."""
+    """Deterministic stub: appends ``[42] * max_new_tokens`` to ``n_samples_per_prompt`` copies of each prompt."""
 
     name = "fake"
 
@@ -83,54 +70,57 @@ class FakeRollout(RolloutEngine):
         self.sync_calls: list = []
 
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
-        B, T_p = request.prompt_ids.shape
-        n = sampling.n_samples_per_prompt
-        T_r = sampling.max_new_tokens
-
-        prompts_expanded = request.prompt_ids.repeat_interleave(n, dim=0)
-        attn_p_expanded = request.prompt_attention_mask.repeat_interleave(n, dim=0)
-        response = torch.full((B * n, T_r), self.response_token, dtype=request.prompt_ids.dtype)
-        response_attn = torch.ones((B * n, T_r), dtype=attn_p_expanded.dtype)
-
-        input_ids = torch.cat([prompts_expanded, response], dim=1)
-        attention_mask = torch.cat([attn_p_expanded, response_attn], dim=1)
-        response_start_idx = torch.full((B * n, ), T_p, dtype=torch.long)
-        return RolloutBatch(input_ids=input_ids, attention_mask=attention_mask, response_start_idx=response_start_idx)
+        response = [self.response_token] * sampling.max_new_tokens
+        samples = []
+        for group_index, prompt in enumerate(request.samples):
+            for _ in range(sampling.n_samples_per_prompt):
+                samples.append(
+                    replace(prompt,
+                            group_index=group_index,
+                            index=len(samples),
+                            tokens=prompt.tokens + response,
+                            attention_mask=prompt.attention_mask + [1] * len(response),
+                            loss_mask=[1] * len(response),
+                            response_length=len(response),
+                            status=Sample.Status.TRUNCATED))
+        return RolloutBatch(samples=samples)
 
     def sync_weights(self, step: int) -> None:
         self.sync_calls.append(step)
 
 
+def _prompt(tokens, attention_mask=None):
+    return Sample(tokens=tokens, attention_mask=attention_mask or [1] * len(tokens))
+
+
 def test_fake_rollout_shape_basic():
     fake = FakeRollout()
-    req = RolloutRequest(prompt_ids=torch.tensor([[1, 2, 3], [4, 5, 6]]),
-                         prompt_attention_mask=torch.ones(2, 3, dtype=torch.long))
+    req = RolloutRequest(samples=[_prompt([1, 2, 3]), _prompt([4, 5, 6])])
     out = fake.generate(req, SamplingConfig(max_new_tokens=4))
-    assert out.input_ids.shape == (2, 7)
-    assert out.attention_mask.shape == (2, 7)
-    # With left-padded (fully real here) prompts of width 3, response begins
-    # at column 3 for every sample.
-    assert out.response_start_idx.tolist() == [3, 3]
+    assert out.batch_size == 2
+    assert out.seq_len == 7
+    assert [sample.tokens[3:] for sample in out.samples] == [[42] * 4] * 2
+    assert [sample.response_length for sample in out.samples] == [4, 4]
 
 
 def test_fake_rollout_with_n_samples():
     fake = FakeRollout()
-    req = RolloutRequest(prompt_ids=torch.tensor([[1, 2], [3, 4]]),
-                         prompt_attention_mask=torch.ones(2, 2, dtype=torch.long))
+    req = RolloutRequest(samples=[_prompt([1, 2]), _prompt([3, 4])])
     out = fake.generate(req, SamplingConfig(max_new_tokens=3, n_samples_per_prompt=4))
-    assert out.input_ids.shape == (8, 5)
-    assert out.response_start_idx.tolist() == [2] * 8
+    assert out.batch_size == 8
+    assert out.seq_len == 5
+    assert [sample.group_index for sample in out.samples] == [0] * 4 + [1] * 4
+    assert [sample.index for sample in out.samples] == list(range(8))
 
 
 def test_fake_rollout_left_padded_prompts():
     fake = FakeRollout()
-    # left-padded prompts: prompt B has only the last 2 positions real, but
-    # response_start_idx still equals the prompt column width T_p.
-    prompt_ids = torch.tensor([[1, 2, 3, 4], [0, 0, 5, 6]])
-    attn = torch.tensor([[1, 1, 1, 1], [0, 0, 1, 1]], dtype=torch.long)
-    req = RolloutRequest(prompt_ids=prompt_ids, prompt_attention_mask=attn)
+    # Prompt B is left-padded: its first two positions are padding, so the response
+    # still follows its last real token and the padding stays masked out.
+    req = RolloutRequest(samples=[_prompt([1, 2, 3, 4]), _prompt([0, 0, 5, 6], [0, 0, 1, 1])])
     out = fake.generate(req, SamplingConfig(max_new_tokens=2))
-    assert out.response_start_idx.tolist() == [4, 4]
+    assert out.samples[1].tokens == [0, 0, 5, 6, 42, 42]
+    assert out.samples[1].attention_mask == [0, 0, 1, 1, 1, 1]
 
 
 def test_sync_records_steps():
