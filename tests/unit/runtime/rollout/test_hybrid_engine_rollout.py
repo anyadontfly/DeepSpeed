@@ -4,7 +4,8 @@
 """Unit tests for HybridEngineRollout.
 
 Most tests are CPU-only; the native shared-prefill cache test runs only when CUDA and
-the transformer inference extension are available.
+the transformer inference extension are available, and the graph-capture sampling test
+only when CUDA is available.
 """
 
 from types import SimpleNamespace
@@ -970,6 +971,54 @@ def test_generate_calls_graph_capture_when_enabled(mock_get_accelerator, mock_pe
     assert profile["decode_forward_ms"] is None
     assert profile["generation_overhead_ms"] == pytest.approx(10.0)
     assert profile["num_decode_forwards"] == 0
+
+
+@pytest.mark.parametrize("unsupported", [{"top_p": 0.9}, {"top_k": 5}, {"repetition_penalty": 1.1}])
+def test_graph_capture_rejects_sampling_options_it_cannot_apply(unsupported):
+    # The graph decode loop samples from softmax(logits / temperature) only; it must not drop these silently.
+    cfg = HybridEngineRolloutConfig(use_graph_capture=True)
+    rollout = HybridEngineRollout(_make_engine(), _make_tokenizer(), cfg=cfg)
+    sampling = SamplingConfig(max_new_tokens=2, temperature=1.0, **unsupported)
+
+    with pytest.raises(ValueError, match="CUDA graph capture"):
+        rollout.generate(_make_request(), sampling)
+
+
+def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribution():
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("CUDA is required for graph capture")
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    config = LlamaConfig(vocab_size=128,
+                         hidden_size=64,
+                         intermediate_size=128,
+                         num_hidden_layers=2,
+                         num_attention_heads=4,
+                         num_key_value_heads=2,
+                         max_position_embeddings=64)
+    model = LlamaForCausalLM(config).to(device).eval()
+    # An EOS id that is never generated keeps every row decoding to max_new_tokens.
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=-1))
+    num_rows, prompt_len, max_new_tokens, temperature = 8, 4, 6, 0.7
+    prompt_ids = torch.tensor([[5, 6, 7, 8]], device=device).repeat(num_rows, 1)
+    prompt_attn = torch.ones_like(prompt_ids)
+
+    # Called directly to test the decode loop on its own, without prompt rendering.
+    with torch.no_grad():
+        output_ids, log_probs = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, temperature, model,
+                                                        device)
+        # Oracle: an ordinary full forward over the generated sequences, scored the way training scores them.
+        logits = model(output_ids).logits.float()
+    responses = output_ids[:, prompt_len:]
+    expected = torch.log_softmax(logits[:, prompt_len - 1:-1] / temperature, dim=-1)
+    expected = expected.gather(2, responses.unsqueeze(-1)).squeeze(-1)
+
+    assert responses.shape == (num_rows, max_new_tokens)
+    # Identical prompts diverge only if tokens are sampled, the first one (chosen after prefill) included.
+    assert len(set(responses[:, 0].tolist())) > 1
+    torch.testing.assert_close(log_probs, expected, atol=1e-4, rtol=1e-4)
 
 
 def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():
