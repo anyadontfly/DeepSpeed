@@ -1331,6 +1331,50 @@ def test_generate_calls_graph_capture_when_enabled(mock_get_accelerator, mock_pe
     assert profile["num_decode_forwards"] == 0
 
 
+@pytest.mark.parametrize("left_padded", [False, True])
+def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribution(left_padded):
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("CUDA is required for graph capture")
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    config = LlamaConfig(vocab_size=128,
+                         hidden_size=64,
+                         intermediate_size=128,
+                         num_hidden_layers=2,
+                         num_attention_heads=4,
+                         num_key_value_heads=2,
+                         max_position_embeddings=64)
+    model = LlamaForCausalLM(config).to(device).eval()
+    # An EOS id that is never generated keeps every row decoding to max_new_tokens.
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=-1))
+    num_rows, prompt_len, max_new_tokens, temperature = 8, 4, 6, 0.7
+    prompt_ids = torch.tensor([[5, 6, 7, 8]], device=device).repeat(num_rows, 1)
+    prompt_attn = torch.ones_like(prompt_ids)
+    if left_padded:
+        # Every other row has a shorter prompt, padded on the left as in a batch.
+        prompt_attn[::2, 0] = 0
+
+    # Called directly to test the decode loop on its own, without prompt rendering.
+    with torch.no_grad():
+        sampling = SamplingConfig(max_new_tokens=max_new_tokens, temperature=temperature)
+        output_ids, log_probs = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, model, device,
+                                                        sampling)
+        # Oracle: an ordinary full forward over the generated sequences, scored the way training scores them.
+        attention_mask = torch.cat((prompt_attn, torch.ones_like(output_ids[:, prompt_len:])), dim=1)
+        logits = model(output_ids, attention_mask=attention_mask).logits.float()
+    responses = output_ids[:, prompt_len:]
+    expected = torch.log_softmax(logits[:, prompt_len - 1:-1] / temperature, dim=-1)
+    expected = expected.gather(2, responses.unsqueeze(-1)).squeeze(-1)
+
+    assert responses.shape == (num_rows, max_new_tokens)
+    # Identical prompts diverge only if tokens are sampled, the first one (chosen after prefill) included.
+    unpadded_rows = prompt_attn.all(dim=1)
+    assert len(set(responses[unpadded_rows, 0].tolist())) > 1
+    torch.testing.assert_close(log_probs, expected, atol=1e-4, rtol=1e-4)
+
+
 class _EchoTool(Tool):
     name = "echo"
     description = "Returns ok."

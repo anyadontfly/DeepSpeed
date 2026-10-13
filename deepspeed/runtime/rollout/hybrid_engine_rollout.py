@@ -1647,8 +1647,12 @@ class HybridEngineRollout(RolloutEngine):
     # ------------------------------------------------------------------
 
     def _generate_graph(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device, sampling):
-        """Decode with DeepSpeedStaticCache + CUDA graph capture, greedy or sampled per ``sampling``."""
-        from transformers import StaticCache
+        """Decode with DeepSpeedStaticCache + CUDA graph capture, greedy or sampled per ``sampling``.
+
+        Only the decode forward is captured. Tokens are chosen eagerly from the
+        graph's output logits after each replay, so sampling draws fresh random
+        numbers every step instead of replaying the captured ones.
+        """
         from deepspeed.utils.static_cache import DeepSpeedStaticCache
 
         batch_size = prompt_ids.shape[0]
@@ -1658,23 +1662,8 @@ class HybridEngineRollout(RolloutEngine):
         model_dtype = next(module.parameters()).dtype
         select_next_tokens = self._token_selector(sampling)
 
-        # --- Prefill with HF StaticCache (correct attention semantics) ---
-        prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device, model_dtype)
-        prefill_attn = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
-        prefill_attn[:, :prompt_len] = prompt_attn
-        prefill_out = module(
-            prompt_ids,
-            attention_mask=prefill_attn,
-            past_key_values=prefill_cache,
-            use_cache=True,
-            cache_position=torch.arange(prompt_len, device=device),
-            **self._last_logits_kwargs(module),
-        )
-        next_token = select_next_tokens(prefill_out.logits[:, -1, :])
-        log_probs = [_chosen_log_probs(prefill_out.logits[:, -1, :], next_token, sampling.temperature)]
-
-        # --- Copy prefill KV into DeepSpeedStaticCache ---
-        write_pos = torch.tensor(prompt_len - 1, dtype=torch.long, device=device)
+        # --- Prefill straight into the cache the graph decodes from ---
+        # A second full-length cache for the prefill alone would double the KV memory of the call.
         ds_cache = DeepSpeedStaticCache(
             module.config,
             batch_size=batch_size,
@@ -1682,15 +1671,22 @@ class HybridEngineRollout(RolloutEngine):
             device=device,
             dtype=model_dtype,
         )
+        # The prompt fills slots 0..prompt_len-1; decoding then writes one slot per step.
+        write_pos = torch.tensor(0, dtype=torch.long, device=device)
         ds_cache.set_write_position(write_pos)
-        # Trigger lazy init then copy real data
-        for layer_idx in range(self._cache_layer_count(ds_cache)):
-            ds_layer = ds_cache.layers[layer_idx]
-            hf_keys, hf_values = self._cache_layer_tensors(prefill_cache, layer_idx)
-            if not ds_layer.is_initialized:
-                ds_layer.lazy_initialization(hf_keys, hf_values)
-            ds_layer.keys[:, :, :prompt_len, :].copy_(hf_keys[:, :, :prompt_len, :])
-            ds_layer.values[:, :, :prompt_len, :].copy_(hf_values[:, :, :prompt_len, :])
+        prefill_kwargs = {
+            "attention_mask": prompt_attn,
+            "past_key_values": ds_cache,
+            "use_cache": True,
+            "cache_position": torch.arange(prompt_len, device=device),
+            # The cache's get_seq_length also counts the slot being written, so a model that derives
+            # positions from it would shift the prompt by one.
+            "position_ids": torch.arange(prompt_len, device=device).expand(batch_size, -1),
+            **self._last_logits_kwargs(module),
+        }
+        prefill_out = module(prompt_ids, **prefill_kwargs)
+        next_token = select_next_tokens(prefill_out.logits[:, -1, :])
+        log_probs = [_chosen_log_probs(prefill_out.logits[:, -1, :], next_token, sampling.temperature)]
 
         output_ids = [prompt_ids, next_token]
 
