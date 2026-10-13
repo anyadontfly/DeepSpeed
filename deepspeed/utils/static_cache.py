@@ -193,6 +193,8 @@ class DeepSpeedStaticCache:
         Dtype for eager initialization.
     """
 
+    is_compileable = True
+
     def __init__(
         self,
         config,
@@ -300,6 +302,16 @@ class DeepSpeedStaticCache:
             # to a shared physical position, so the largest row is sufficient.
             return length.max()
         return length
+
+    def get_query_offset(self, layer_idx: int = 0) -> int | torch.Tensor:
+        # Transformers >= 5 places the queries at this offset when building the causal mask. The decode
+        # tokens are written at the write position, while get_seq_length also counts the token being written.
+        if self._write_position is None:
+            return 0
+        if self._write_position.dim() == 1:
+            # Continuous batching aligns rows to a shared physical position, as in get_seq_length.
+            return self._write_position.max()
+        return self._write_position
 
     def get_max_cache_shape(self, layer_idx: int = 0) -> int:
         if layer_idx >= len(self._layers):

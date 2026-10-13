@@ -545,8 +545,9 @@ class HybridEngineRollout(RolloutEngine):
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
         if self.use_graph_capture:
+            # The graph loop drives the causal LM directly, not a wrapper whose generate delegates to it.
             return self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, sampling.temperature,
-                                        module, prompt_ids.device)
+                                        _generate_forward_module(module), prompt_ids.device)
 
         # ZeRO-3 gathers parameters during each decode forward, so every
         # data-parallel rank must run the same number of decode steps and
