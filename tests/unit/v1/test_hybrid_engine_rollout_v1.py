@@ -10,7 +10,7 @@ import torch
 from transformers import PretrainedConfig
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.rollout.base import RolloutRequest, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
 
 
@@ -45,18 +45,18 @@ def test_continuous_generation_profile_on_accelerator():
     model = CacheClassModel().to(device)
     rollout = HybridEngineRollout(
         SimpleNamespace(module=model),
-        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        SimpleNamespace(pad_token_id=0, eos_token_id=2, decode=lambda ids, **_kwargs: ""),
         cfg=HybridEngineRolloutConfig(enable_profiling=True),
     )
-    request = RolloutRequest(
-        torch.tensor([[1, 2, 3], [1, 2, 4]], device=device),
-        torch.ones((2, 3), dtype=torch.long, device=device),
-    )
+    request = RolloutRequest(samples=[
+        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
+        Sample(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
+    ])
 
     output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1))
 
     profile = rollout.get_last_profile()
-    assert output.input_ids[:, 3:].cpu().tolist() == [[7, 7], [7, 7]]
+    assert [sample.tokens[3:] for sample in output.samples] == [[7, 7], [7, 7]]
     assert profile["num_prefill_forwards"] == 2
     assert profile["num_decode_forwards"] == 2
     assert profile["num_generated_tokens"] == 4
