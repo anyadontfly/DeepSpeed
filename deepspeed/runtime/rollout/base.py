@@ -41,6 +41,7 @@ class SamplingConfig:
     """
 
     max_new_tokens: int
+    max_new_tokens_per_turn: Optional[int] = None
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
