@@ -985,7 +985,8 @@ def test_graph_capture_rejects_sampling_options_it_cannot_apply(unsupported):
         rollout.generate(_make_request(), sampling)
 
 
-def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribution():
+@pytest.mark.parametrize("left_padded", [False, True])
+def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribution(left_padded):
     if not torch.cuda.is_available():  #ignore-cuda
         pytest.skip("CUDA is required for graph capture")
     from transformers import LlamaConfig, LlamaForCausalLM
@@ -1005,20 +1006,25 @@ def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribut
     num_rows, prompt_len, max_new_tokens, temperature = 8, 4, 6, 0.7
     prompt_ids = torch.tensor([[5, 6, 7, 8]], device=device).repeat(num_rows, 1)
     prompt_attn = torch.ones_like(prompt_ids)
+    if left_padded:
+        # Every other row has a shorter prompt, padded on the left as in a batch.
+        prompt_attn[::2, 0] = 0
 
     # Called directly to test the decode loop on its own, without prompt rendering.
     with torch.no_grad():
         output_ids, log_probs = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, temperature, model,
                                                         device)
         # Oracle: an ordinary full forward over the generated sequences, scored the way training scores them.
-        logits = model(output_ids).logits.float()
+        attention_mask = torch.cat((prompt_attn, torch.ones_like(output_ids[:, prompt_len:])), dim=1)
+        logits = model(output_ids, attention_mask=attention_mask).logits.float()
     responses = output_ids[:, prompt_len:]
     expected = torch.log_softmax(logits[:, prompt_len - 1:-1] / temperature, dim=-1)
     expected = expected.gather(2, responses.unsqueeze(-1)).squeeze(-1)
 
     assert responses.shape == (num_rows, max_new_tokens)
     # Identical prompts diverge only if tokens are sampled, the first one (chosen after prefill) included.
-    assert len(set(responses[:, 0].tolist())) > 1
+    unpadded_rows = prompt_attn.all(dim=1)
+    assert len(set(responses[unpadded_rows, 0].tolist())) > 1
     torch.testing.assert_close(log_probs, expected, atol=1e-4, rtol=1e-4)
 
 

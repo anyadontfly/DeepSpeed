@@ -1275,7 +1275,6 @@ class HybridEngineRollout(RolloutEngine):
         graph's output logits after each replay, so sampling draws fresh random
         numbers every step instead of replaying the captured ones.
         """
-        from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache
 
         batch_size = prompt_ids.shape[0]
@@ -1284,22 +1283,8 @@ class HybridEngineRollout(RolloutEngine):
         eos_token_id = self.tokenizer.eos_token_id
         model_dtype = next(module.parameters()).dtype
 
-        # --- Prefill with HF StaticCache (correct attention semantics) ---
-        prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, max_len, device, model_dtype)
-        prefill_attn = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
-        prefill_attn[:, :prompt_len] = prompt_attn
-        prefill_out = module(
-            prompt_ids,
-            attention_mask=prefill_attn,
-            past_key_values=prefill_cache,
-            use_cache=True,
-            cache_position=torch.arange(prompt_len, device=device),
-        )
-        next_token, first_log_probs = _select_next_tokens(prefill_out.logits[:, -1, :], temperature)
-        log_probs = [first_log_probs]
-
-        # --- Copy prefill KV into DeepSpeedStaticCache ---
-        write_pos = torch.tensor(prompt_len - 1, dtype=torch.long, device=device)
+        # --- Prefill straight into the cache the graph decodes from ---
+        # A second full-length cache for the prefill alone would double the KV memory of the call.
         ds_cache = DeepSpeedStaticCache(
             module.config,
             batch_size=batch_size,
@@ -1307,15 +1292,24 @@ class HybridEngineRollout(RolloutEngine):
             device=device,
             dtype=model_dtype,
         )
+        # The prompt fills slots 0..prompt_len-1; decoding then writes one slot per step.
+        write_pos = torch.tensor(0, dtype=torch.long, device=device)
         ds_cache.set_write_position(write_pos)
-        # Trigger lazy init then copy real data
-        for layer_idx in range(self._cache_layer_count(ds_cache)):
-            ds_layer = ds_cache.layers[layer_idx]
-            hf_keys, hf_values = self._cache_layer_tensors(prefill_cache, layer_idx)
-            if not ds_layer.is_initialized:
-                ds_layer.lazy_initialization(hf_keys, hf_values)
-            ds_layer.keys[:, :, :prompt_len, :].copy_(hf_keys[:, :, :prompt_len, :])
-            ds_layer.values[:, :, :prompt_len, :].copy_(hf_values[:, :, :prompt_len, :])
+        prefill_kwargs = {
+            "attention_mask": prompt_attn,
+            "past_key_values": ds_cache,
+            "use_cache": True,
+            "cache_position": torch.arange(prompt_len, device=device),
+            # The cache's get_seq_length also counts the slot being written, so a model that derives
+            # positions from it would shift the prompt by one.
+            "position_ids": torch.arange(prompt_len, device=device).expand(batch_size, -1),
+        }
+        # Only the last position picks the first token; full prefill logits are [batch, prompt_len, vocab].
+        if "logits_to_keep" in signature(module.forward).parameters:
+            prefill_kwargs["logits_to_keep"] = 1
+        prefill_out = module(prompt_ids, **prefill_kwargs)
+        next_token, first_log_probs = _select_next_tokens(prefill_out.logits[:, -1, :], temperature)
+        log_probs = [first_log_probs]
 
         output_ids = [prompt_ids, next_token]
 
