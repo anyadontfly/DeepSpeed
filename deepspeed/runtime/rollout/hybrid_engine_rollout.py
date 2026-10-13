@@ -18,7 +18,7 @@ Two generation paths:
 import asyncio
 import time
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from inspect import signature
 from typing import Optional
 
@@ -229,6 +229,9 @@ class HybridEngineRollout(RolloutEngine):
         if not samples:
             return RolloutBatch(samples=[])
         self._check_sampling(sampling)
+        if sampling.max_new_tokens_per_turn is not None:
+            max_new_tokens = min(sampling.max_new_tokens, sampling.max_new_tokens_per_turn)
+            sampling = replace(sampling, max_new_tokens=max_new_tokens, max_new_tokens_per_turn=None)
         if sampling.continuous_batch_size is not None:
             return self._generate_continuous(samples, sampling, sampling.continuous_batch_size)
         device = get_accelerator().current_device_name()
@@ -378,11 +381,14 @@ class HybridEngineRollout(RolloutEngine):
         active = list(range(len(trajectories)))
 
         for _turn in range(self.max_turns):
-            # Each trajectory may generate up to its remaining token budget and the
-            # room left in its context; one with no room stops before generating.
+            # Each trajectory may generate up to its remaining token budget, the
+            # per-turn cap and the room left in its context; one with no room
+            # stops before generating.
             room = {}
             for i in active:
                 room[i] = max_new_tokens - generated[i]
+                if sampling.max_new_tokens_per_turn is not None:
+                    room[i] = min(room[i], sampling.max_new_tokens_per_turn)
                 if self.max_context_len is not None:
                     room[i] = min(room[i], self.max_context_len - sum(trajectories[i].attention_mask))
                 if room[i] <= 0:
@@ -525,6 +531,8 @@ class HybridEngineRollout(RolloutEngine):
         return RolloutBatch(samples=trajectories)
 
     def _check_sampling(self, sampling: SamplingConfig) -> None:
+        if sampling.max_new_tokens_per_turn is not None and sampling.max_new_tokens_per_turn <= 0:
+            raise ValueError("max_new_tokens_per_turn must be positive")
         return_log_probs = sampling.return_log_probs
         if return_log_probs and sampling.temperature > 0.0 and (sampling.top_p < 1.0 or sampling.top_k > 0):
             raise ValueError("return_log_probs requires top_p=1 and top_k<=0 when sampling")

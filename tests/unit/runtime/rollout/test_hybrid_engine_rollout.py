@@ -21,6 +21,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.transformer.inference.op_binding.workspace import WorkspaceOp
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
 from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.tool import Tool, ToolSet
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     HybridEngineRollout,
     HybridEngineRolloutConfig,
@@ -1328,6 +1329,82 @@ def test_generate_calls_graph_capture_when_enabled(mock_get_accelerator, mock_pe
     assert profile["decode_forward_ms"] is None
     assert profile["generation_overhead_ms"] == pytest.approx(10.0)
     assert profile["num_decode_forwards"] == 0
+
+
+class _EchoTool(Tool):
+    name = "echo"
+    description = "Returns ok."
+    parameters = {"type": "object", "properties": {}}
+
+    async def execute(self, arguments):
+        return "ok"
+
+
+_TOOL_CALL_TOKEN = 7
+
+
+def _multi_turn_rollout(responses_per_turn):
+    """A multi-turn rollout whose model emits ``responses_per_turn`` in order and calls ``echo`` on token 7."""
+    engine = _make_engine()
+    responses = iter(responses_per_turn)
+
+    def generate(prompt_ids, **_kwargs):
+        response = torch.tensor([next(responses)])
+        return torch.cat((prompt_ids, response), dim=1)
+
+    engine.module.generate.side_effect = generate
+    tokenizer = _make_tokenizer()
+    call_text = '<tool_call>{"name": "echo", "arguments": {}}</tool_call>'
+    tokenizer.decode.side_effect = lambda ids, **_kwargs: call_text if _TOOL_CALL_TOKEN in ids else ""
+    cfg = HybridEngineRolloutConfig(multi_turn=True, max_turns=4)
+    return engine, HybridEngineRollout(engine, tokenizer, cfg=cfg, tools=ToolSet([_EchoTool()]))
+
+
+@pytest.mark.parametrize("max_new_tokens_per_turn, turn_budgets", [(None, [3, 1]), (2, [2, 1])])
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=[9])
+def test_multi_turn_caps_each_turn_and_the_whole_response(_tokenize_tool_responses, max_new_tokens_per_turn,
+                                                          turn_budgets):
+    engine, rollout = _multi_turn_rollout([[_TOOL_CALL_TOKEN, 2], [5, 6, 2][:turn_budgets[1]]])
+    sampling = SamplingConfig(max_new_tokens=3, max_new_tokens_per_turn=max_new_tokens_per_turn, temperature=0)
+
+    sample = rollout.generate(RolloutRequest(samples=[_prompt([10, 11])]), sampling).samples[0]
+
+    # The second turn gets what is left of max_new_tokens (3 - 2), whatever the per-turn cap.
+    assert [call.kwargs["max_new_tokens"] for call in engine.module.generate.call_args_list] == turn_budgets
+    assert sample.tokens == [10, 11, _TOOL_CALL_TOKEN, 2, 9, 5]
+    assert sample.loss_mask == [1, 1, 0, 1]
+    assert sample.status == Sample.Status.TRUNCATED
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=[9])
+def test_multi_turn_per_turn_cap_resets_every_turn(_tokenize_tool_responses):
+    # miles' rollout_max_response_len: every turn may generate up to the cap, beyond it in total.
+    engine, rollout = _multi_turn_rollout([[_TOOL_CALL_TOKEN, 2], [_TOOL_CALL_TOKEN, 2], [5, 2]])
+    sampling = SamplingConfig(max_new_tokens=100, max_new_tokens_per_turn=2, temperature=0)
+
+    sample = rollout.generate(RolloutRequest(samples=[_prompt([10, 11])]), sampling).samples[0]
+
+    assert [call.kwargs["max_new_tokens"] for call in engine.module.generate.call_args_list] == [2, 2, 2]
+    assert sample.response_length == 8
+    assert sample.status == Sample.Status.COMPLETED
+
+
+def test_single_turn_applies_the_per_turn_cap():
+    engine = _make_engine()
+    engine.module.generate.return_value = torch.tensor([[10, 11, 5, 6]])
+    rollout = HybridEngineRollout(engine, _make_tokenizer())
+    sampling = SamplingConfig(max_new_tokens=8, max_new_tokens_per_turn=2, temperature=0)
+
+    rollout.generate(RolloutRequest(samples=[_prompt([10, 11])]), sampling)
+
+    assert engine.module.generate.call_args.kwargs["max_new_tokens"] == 2
+
+
+def test_rejects_non_positive_per_turn_cap():
+    rollout = HybridEngineRollout(_make_engine(), _make_tokenizer())
+
+    with pytest.raises(ValueError, match="max_new_tokens_per_turn"):
+        rollout.generate(_make_request(), SamplingConfig(max_new_tokens=8, max_new_tokens_per_turn=0))
 
 
 def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():
