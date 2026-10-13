@@ -1234,7 +1234,7 @@ def test_generate_uses_shared_prefill_for_multiple_samples():
 
         def generate(self, input_ids, attention_mask=None, max_new_tokens=1, **_kwargs):
             self(input_ids=input_ids, attention_mask=attention_mask)
-            response = torch.ones(input_ids.shape[0], max_new_tokens, dtype=input_ids.dtype)
+            response = torch.ones(input_ids.shape[0], max_new_tokens, dtype=input_ids.dtype, device=input_ids.device)
             return torch.cat((input_ids, response), dim=1)
 
     engine = _make_engine()
@@ -1393,7 +1393,7 @@ def _multi_turn_rollout(responses_per_turn):
     responses = iter(responses_per_turn)
 
     def generate(prompt_ids, **_kwargs):
-        response = torch.tensor([next(responses)])
+        response = torch.tensor([next(responses)], device=prompt_ids.device)
         return torch.cat((prompt_ids, response), dim=1)
 
     engine.module.generate.side_effect = generate
