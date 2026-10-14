@@ -86,17 +86,7 @@ class _ForwardProfiler:
 
 
 def _sampled_log_prob_recorder(temperature: float = 1.0):
-    """Return ``(processor, finish)`` that record each sampled token's log-probability.
-
-    Pass ``processor`` to ``generate`` as a logits processor; after generation,
-    ``finish(last_tokens)`` returns the log-probs ``[B, T]`` under
-    ``softmax(logits / temperature)``, the policy being sampled and trained,
-    so the trainer must divide its logits by the same temperature. Hugging
-    Face runs custom processors before its own temperature warper, so the
-    scores seen here are raw and the temperature is applied here. The token
-    chosen at one step only appears in ``input_ids`` at the next call, so each
-    call scores the previous step and ``finish`` scores the last one.
-    """
+    """Return ``(processor, finish)`` that record each sampled token's log-probability."""
     steps = []
     previous = []
 
@@ -113,31 +103,12 @@ def _sampled_log_prob_recorder(temperature: float = 1.0):
     return processor, finish
 
 
-def _generate_forward_module(module):
-    """The module whose forward ``module.generate`` runs at each generation step.
-
-    Hugging Face ``generate`` calls the forward of the model it belongs to, so
-    a wrapper whose ``generate`` delegates to an inner model is never called
-    while generating. The outermost module with a ``generation_config`` owns
-    the ``generate`` that runs.
-    """
-    for candidate in module.modules():
-        if getattr(candidate, "generation_config", None) is not None:
-            return candidate
-    return module
-
-
 def _chosen_log_probs(logits, tokens):
     return torch.log_softmax(logits.float(), dim=-1).gather(1, tokens)
 
 
 def _select_next_tokens(logits, temperature):
-    """Pick the next tokens ``[B, 1]`` from ``logits`` ``[B, V]`` and return them with their log-probs.
-
-    The log-probs are under ``softmax(logits / temperature)``, the distribution
-    actually sampled from, matching ``_sampled_log_prob_recorder``; greedy
-    decoding scores the raw logits, i.e. temperature 1.
-    """
+    """Pick the next tokens ``[B, 1]`` from ``logits`` ``[B, V]`` and return them with their log-probs."""
     if temperature <= 0.0:
         tokens = logits.argmax(dim=-1, keepdim=True)
         return tokens, _chosen_log_probs(logits, tokens)
@@ -255,7 +226,7 @@ class HybridEngineRollout(RolloutEngine):
         forward_profile_handles = []
         if self.enable_profiling and not self.use_graph_capture:
             forward_profiler = _ForwardProfiler(accelerator)
-            forward_profile_handles = forward_profiler.register(_generate_forward_module(module))
+            forward_profile_handles = forward_profiler.register(module)
 
         shared_prefill_handles = []
         try:
@@ -411,7 +382,7 @@ class HybridEngineRollout(RolloutEngine):
             forward_profile_handles = []
             if self.enable_profiling and not self.use_graph_capture:
                 forward_profiler = _ForwardProfiler(accelerator)
-                forward_profile_handles = forward_profiler.register(_generate_forward_module(module))
+                forward_profile_handles = forward_profiler.register(module)
 
             # One generate call serves all active trajectories, so it runs to the
             # largest remaining budget; each row is cut back to its own below.
@@ -545,9 +516,8 @@ class HybridEngineRollout(RolloutEngine):
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
         if self.use_graph_capture:
-            # The graph loop drives the causal LM directly, not a wrapper whose generate delegates to it.
             return self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, sampling.temperature,
-                                        _generate_forward_module(module), prompt_ids.device)
+                                        module, prompt_ids.device)
 
         # ZeRO-3 gathers parameters during each decode forward, so every
         # data-parallel rank must run the same number of decode steps and

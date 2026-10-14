@@ -1028,49 +1028,6 @@ def test_graph_capture_samples_with_temperature_and_scores_the_sampled_distribut
     torch.testing.assert_close(log_probs, expected, atol=1e-4, rtol=1e-4)
 
 
-class _TrainingWrapper(torch.nn.Module):
-    """Wraps a causal LM the way a trainer's policy does: generate delegates, forward is the trainer's own."""
-
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-
-    def generate(self, *args, **kwargs):
-        return self.model.generate(*args, **kwargs)
-
-    def forward(self, input_ids, attention_mask):
-        raise AssertionError("rollout must not call the training forward")
-
-
-def test_graph_capture_decodes_through_a_wrapper_whose_generate_delegates():
-    if not torch.cuda.is_available():  #ignore-cuda
-        pytest.skip("CUDA is required for graph capture")
-    from transformers import LlamaConfig, LlamaForCausalLM
-
-    torch.manual_seed(0)
-    config = LlamaConfig(vocab_size=128,
-                         hidden_size=64,
-                         intermediate_size=128,
-                         num_hidden_layers=2,
-                         num_attention_heads=4,
-                         num_key_value_heads=2,
-                         max_position_embeddings=64)
-    model = LlamaForCausalLM(config).to(torch.device("cuda")).eval()
-    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=-1, decode=lambda ids, **_kwargs: "")
-    cfg = HybridEngineRolloutConfig(use_graph_capture=True)
-    sampling = SamplingConfig(max_new_tokens=4, temperature=0)
-
-    def rollout_tokens(module):
-        rollout = HybridEngineRollout(SimpleNamespace(module=module), tokenizer, cfg=cfg)
-        request = RolloutRequest(samples=[_prompt([5, 6, 7, 8])])
-        return rollout.generate(request, sampling).samples[0].tokens
-
-    expected = rollout_tokens(model)
-
-    assert len(expected) == 8
-    assert rollout_tokens(_TrainingWrapper(model)) == expected
-
-
 class _EchoTool(Tool):
     name = "echo"
     description = "Returns ok."
