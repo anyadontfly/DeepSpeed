@@ -289,6 +289,85 @@ class TestKernelReferenceConsistency:
             expected = ref_decode_attn(q.float(), K.float(), V.float(), ref_pos)
             torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
 
+    def test_decode_attn_rejects_strided_q(self):
+        """The kernel indexes q as packed [b, heads, head_dim]: a strided view,
+        such as the query half of a fused query|gate projection, must raise
+        rather than be read as the wrong heads."""
+        nq, nkv, hd, maxlen = 4, 2, 64, 8
+        q = _rand_bf16(1, nq, 2 * hd)[..., :hd]
+        K = _rand_bf16(1, nkv, maxlen, hd)
+        V = _rand_bf16(1, nkv, maxlen, hd)
+        out = torch.empty(1, nq, hd, dtype=torch.bfloat16, device=DEV)
+        pos = torch.tensor([3], dtype=torch.long, device=DEV)
+        with pytest.raises(RuntimeError, match="q must be contiguous"):
+            _op().decode_attn(q, K, V, pos, out, nq, nkv, hd, maxlen)
+
+
+class _BufferKVCache:
+    """Static KV buffers written at per-row GPU positions, like DeepSpeedStaticCache."""
+
+    def __init__(self, keys, values, write_pos):
+        self.keys, self.values, self._write_position = keys, values, write_pos
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
+        rows = torch.arange(key_states.shape[0], device=key_states.device)
+        self.keys[rows, :, self._write_position] = key_states[:, :, 0]
+        self.values[rows, :, self._write_position] = value_states[:, :, 0]
+        return self.keys, self.values
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="non-CPU device required")
+class TestDecodeAttentionForwardParity:
+    """The installed decode-attention forward vs the HF attention forward it
+    replaces, on a randomly initialized Qwen3.5 full-attention layer. Unlike
+    the kernel tests above, the kernel gets exactly the tensors the model
+    hands it (views included)."""
+
+    @pytest.mark.parametrize("positions", [[9], [5, 17, 0]])
+    def test_matches_hf_attention(self, positions):
+        transformers_qwen3_5 = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+        from deepspeed.module_inject.segment_ki import install_decode_attention
+
+        torch.manual_seed(0)
+        config = Qwen3_5TextConfig(vocab_size=64,
+                                   hidden_size=256,
+                                   num_hidden_layers=1,
+                                   num_attention_heads=8,
+                                   num_key_value_heads=2,
+                                   head_dim=256,
+                                   layer_types=["full_attention"])
+        config._attn_implementation = "sdpa"
+        attn = transformers_qwen3_5.Qwen3_5Attention(config, layer_idx=0).to(DEV, torch.bfloat16).eval()
+        torch.nn.init.normal_(attn.q_norm.weight, std=0.1)
+        torch.nn.init.normal_(attn.k_norm.weight, std=0.1)
+
+        batch, maxlen, nkv, hd = len(positions), 24, 2, 256
+        rotary = transformers_qwen3_5.Qwen3_5TextRotaryEmbedding(config).to(DEV)
+        cos_t, sin_t = rotary(torch.zeros(1, maxlen, dtype=torch.bfloat16, device=DEV),
+                              torch.arange(maxlen, device=DEV)[None])
+        write_pos = torch.tensor(positions, dtype=torch.long, device=DEV)
+        patched = install_decode_attention(attn,
+                                           write_pos,
+                                           _op(),
+                                           cos_table=cos_t[0].float().contiguous(),
+                                           sin_table=sin_t[0].float().contiguous())
+        assert patched == 1
+
+        hidden = _rand_bf16(batch, 1, config.hidden_size)
+        keys = _rand_bf16(batch, nkv, maxlen, hd)
+        values = _rand_bf16(batch, nkv, maxlen, hd)
+        position_embeddings = (cos_t[0][write_pos].unsqueeze(1), sin_t[0][write_pos].unsqueeze(1))
+        mask = (torch.arange(maxlen, device=DEV)[None, :] <= write_pos[:, None]).view(batch, 1, 1, maxlen)
+
+        with torch.no_grad():
+            expected, _ = attn._ki_orig_attn_forward(hidden, position_embeddings, mask,
+                                                     _BufferKVCache(keys.clone(), values.clone(), write_pos))
+            out, _ = attn(hidden, position_embeddings, mask, _BufferKVCache(keys.clone(), values.clone(), write_pos))
+
+        rel_err = (out.float() - expected.float()).norm() / expected.float().norm()
+        assert rel_err < 2e-2, f"decode-attention forward differs from HF attention: relative error {rel_err:.3f}"
+
 
 # ---------------------------------------------------------------------------
 # 2. Composite paths and injection invariants (CPU)

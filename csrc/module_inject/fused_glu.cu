@@ -588,6 +588,10 @@ void decode_attn(at::Tensor q,
                  int64_t rope_dim)
 {
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
+    // The kernel indexes q as packed [batch, num_q_heads, head_dim]; a strided
+    // view (e.g. the query half of a fused query|gate projection) would be
+    // read as the wrong heads.
+    TORCH_CHECK(q.is_contiguous(), "q must be contiguous");
     TORCH_CHECK(K.is_contiguous() && V.is_contiguous(), "K/V must be contiguous");
     TORCH_CHECK(write_pos.is_cuda() && write_pos.scalar_type() == at::ScalarType::Long,
                 "write_pos must be a CUDA int64 tensor");

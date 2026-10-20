@@ -545,8 +545,11 @@ def _decode_attn_forward(self,
     batch = hidden_states.shape[0]
     out = torch.empty(batch, num_q_heads, head_dim, dtype=hidden_states.dtype, device=hidden_states.device)
     fuse_q = getattr(self, "_ki_q_norm_w", None) is not None
+    # query_states is a strided view into q_proj's per-head [query | gate]
+    # layout (head stride 2 * head_dim); the kernel indexes q as packed
+    # [batch, num_q_heads, head_dim], so it must get a contiguous copy.
+    query_states = query_states.reshape(batch, num_q_heads, head_dim).contiguous()
     if fuse_q:
-        query_states = query_states.reshape(batch, num_q_heads, head_dim)
         gate = gate.reshape(batch, num_q_heads * head_dim).contiguous()
         self._ki_attn_op.decode_attn(query_states,
                                      key_states,
@@ -564,8 +567,10 @@ def _decode_attn_forward(self,
                                      eps=self.q_norm.eps,
                                      rope_dim=self._ki_cos_t.shape[-1])
     else:
-        self._ki_attn_op.decode_attn(query_states.reshape(batch, num_q_heads, head_dim), key_states, value_states,
-                                     self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
+        # NOTE: this branch (no RoPE tables) skips q_norm, the q-side RoPE and
+        # the output gate, so it does not match the HF forward either.
+        self._ki_attn_op.decode_attn(query_states, key_states, value_states, self._ki_write_pos, out, num_q_heads,
+                                     num_kv_heads, head_dim, key_states.shape[2])
 
     attn_output = out.view(*input_shape, -1)
     return self.o_proj(attn_output), None
