@@ -16,8 +16,8 @@ import torch
 
 from deepspeed.ops.transformer.inference.op_binding.workspace import WorkspaceOp
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
-from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
-from deepspeed.runtime.rollout.tool import Tool, ToolSet
+from deepspeed.runtime.rollout.base import RolloutConfig, RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.tool import Tool, ToolCall, ToolSet, parse_qwen3_coder_tool_calls
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     HybridEngineRollout,
     HybridEngineRolloutConfig,
@@ -1040,8 +1040,11 @@ class _EchoTool(Tool):
 _TOOL_CALL_TOKEN = 7
 
 
-def _multi_turn_rollout(responses_per_turn):
-    """A multi-turn rollout whose model emits ``responses_per_turn`` in order and calls ``echo`` on token 7."""
+def _multi_turn_rollout(responses_per_turn,
+                        call_text='<tool_call>{"name": "echo", "arguments": {}}</tool_call>',
+                        tools=None,
+                        **cfg_kwargs):
+    """A multi-turn rollout whose model emits ``responses_per_turn`` in order, and ``call_text`` on token 7."""
     engine = _make_engine()
     responses = iter(responses_per_turn)
 
@@ -1051,10 +1054,10 @@ def _multi_turn_rollout(responses_per_turn):
 
     engine.module.generate.side_effect = generate
     tokenizer = _make_tokenizer()
-    call_text = '<tool_call>{"name": "echo", "arguments": {}}</tool_call>'
     tokenizer.decode.side_effect = lambda ids, **_kwargs: call_text if _TOOL_CALL_TOKEN in ids else ""
-    cfg = HybridEngineRolloutConfig(multi_turn=True, max_turns=4)
-    return engine, HybridEngineRollout(engine, tokenizer, cfg=cfg, tools=ToolSet([_EchoTool()]))
+    cfg = HybridEngineRolloutConfig(multi_turn=True, max_turns=4, **cfg_kwargs)
+    tools = tools if tools is not None else ToolSet([_EchoTool()])
+    return engine, HybridEngineRollout(engine, tokenizer, cfg=cfg, tools=tools)
 
 
 @pytest.mark.parametrize("max_new_tokens_per_turn, turn_budgets", [(None, [3, 1]), (2, [2, 1])])
@@ -1084,6 +1087,151 @@ def test_multi_turn_per_turn_cap_resets_every_turn(_tokenize_tool_responses):
     assert [call.kwargs["max_new_tokens"] for call in engine.module.generate.call_args_list] == [2, 2, 2]
     assert sample.response_length == 8
     assert sample.status == Sample.Status.COMPLETED
+
+
+class _TypedTool(Tool):
+    name = "typed"
+    description = "Takes one argument of each schema type."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string"
+            },
+            "count": {
+                "type": "integer"
+            },
+            "scale": {
+                "type": "number"
+            },
+            "flag": {
+                "type": "boolean"
+            },
+            "options": {
+                "type": "object"
+            },
+            "items": {
+                "type": "array"
+            },
+            "limit": {
+                "type": ["integer", "null"]
+            },
+        },
+    }
+
+    def __init__(self):
+        self.calls = []
+
+    async def execute(self, arguments):
+        self.calls.append(arguments)
+        return "ok"
+
+
+# Tool calls written the way the Qwen3.5 chat template renders them: each value on lines of its own.
+_QWEN3_CODER_TYPED_CALL = ("I will run it.\n\n<tool_call>\n<function=typed>\n"
+                           "<parameter=code>\nx = 42\nprint(x)\n</parameter>\n"
+                           "<parameter=count>\n3\n</parameter>\n"
+                           "<parameter=scale>\n0.5\n</parameter>\n"
+                           "<parameter=flag>\ntrue\n</parameter>\n"
+                           '<parameter=options>\n{"mode": "fast"}\n</parameter>\n'
+                           "<parameter=items>\n[1, 2]\n</parameter>\n"
+                           "<parameter=limit>\nnull\n</parameter>\n"
+                           "</function>\n</tool_call>")
+
+
+def test_qwen3_coder_parser_converts_arguments_to_their_schema_types():
+    calls = parse_qwen3_coder_tool_calls(_QWEN3_CODER_TYPED_CALL, ToolSet([_TypedTool()]))
+
+    assert calls == [
+        ToolCall(name="typed",
+                 arguments={
+                     "code": "x = 42\nprint(x)",
+                     "count": 3,
+                     "scale": 0.5,
+                     "flag": True,
+                     "options": {
+                         "mode": "fast"
+                     },
+                     "items": [1, 2],
+                     "limit": None,
+                 })
+    ]
+
+
+def test_qwen3_coder_parser_keeps_text_where_the_schema_does_not_say_otherwise():
+    text = ("<tool_call>\n<function=typed>\n<parameter=code>\n42\n</parameter>\n"
+            "<parameter=count>\nthree\n</parameter>\n<parameter=extra>\n7\n</parameter>\n</function>\n</tool_call>")
+
+    calls = parse_qwen3_coder_tool_calls(text, ToolSet([_TypedTool()]))
+
+    # A string parameter that looks like a number stays a string; so do unconvertible and undeclared values.
+    assert calls == [ToolCall(name="typed", arguments={"code": "42", "count": "three", "extra": "7"})]
+
+
+def test_qwen3_coder_parser_reads_several_calls_in_one_turn():
+    text = ("<tool_call>\n<function=echo>\n</function>\n</tool_call>\n"
+            "<tool_call>\n<function=typed>\n<parameter=count>\n1\n</parameter>\n</function>\n</tool_call>")
+
+    calls = parse_qwen3_coder_tool_calls(text, ToolSet([_EchoTool(), _TypedTool()]))
+
+    assert calls == [ToolCall(name="echo"), ToolCall(name="typed", arguments={"count": 1})]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<tool_call>\nno function here\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=code>\nx\n</parameter>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=code>\nx\n</function>\n</tool_call>",
+        "<tool_call>\n<function=typed>\n<parameter=code>\nx",
+    ],
+    ids=["no_function", "unclosed_function", "unclosed_parameter", "cut_off"],
+)
+def test_qwen3_coder_parser_reports_malformed_calls(text):
+    calls = parse_qwen3_coder_tool_calls(text, ToolSet([_TypedTool()]))
+
+    # The model is told what went wrong rather than the call disappearing.
+    assert len(calls) == 1
+    assert calls[0].error is not None
+
+
+def test_qwen3_coder_parser_reads_the_qwen3_5_chat_template():
+    from transformers import AutoTokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B", local_files_only=True)
+    except OSError:
+        pytest.skip("Qwen/Qwen3.5-4B tokenizer is not in the local Hugging Face cache")
+    arguments = {"code": "for i in range(3):\n    print(i)", "count": 2, "options": {"mode": "fast"}}
+    tool_call = {"type": "function", "function": {"name": "typed", "arguments": arguments}}
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "", "tool_calls": [tool_call]}]
+
+    rendered = tokenizer.apply_chat_template(messages, tokenize=False)
+
+    assert parse_qwen3_coder_tool_calls(rendered, ToolSet([_TypedTool()])) == [ToolCall("typed", arguments)]
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=[9])
+def test_multi_turn_runs_tools_called_in_the_configured_format(tokenize_tool_responses):
+    tool = _TypedTool()
+    engine, rollout = _multi_turn_rollout([[_TOOL_CALL_TOKEN, 2], [5, 2]],
+                                          call_text=_QWEN3_CODER_TYPED_CALL,
+                                          tools=ToolSet([tool]),
+                                          tool_call_parser="qwen3_coder")
+
+    sample = rollout.generate(RolloutRequest(samples=[_prompt([10, 11])]),
+                              SamplingConfig(max_new_tokens=8, temperature=0)).samples[0]
+
+    assert [call["count"] for call in tool.calls] == [3]
+    tool_messages = tokenize_tool_responses.call_args.args[0]
+    assert [(message["name"], message["content"]) for message in tool_messages] == [("typed", "ok")]
+    assert sample.tokens == [10, 11, _TOOL_CALL_TOKEN, 2, 9, 5, 2]
+    assert sample.status == Sample.Status.COMPLETED
+
+
+@pytest.mark.parametrize("config_type", [HybridEngineRolloutConfig, RolloutConfig])
+def test_configs_reject_unknown_tool_call_parser(config_type):
+    with pytest.raises(ValueError, match="tool_call_parser"):
+        config_type(tool_call_parser="xml")
 
 
 def test_single_turn_applies_the_per_turn_cap():

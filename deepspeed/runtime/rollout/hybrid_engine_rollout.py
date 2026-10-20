@@ -26,7 +26,7 @@ import torch
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRequest, Sample, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
-from deepspeed.runtime.rollout.tool import ToolSet, parse_hermes_tool_calls
+from deepspeed.runtime.rollout.tool import TOOL_CALL_PARSERS, ToolSet
 from deepspeed.runtime.rollout.utils import (
     expand_samples,
     left_pad_samples,
@@ -150,10 +150,16 @@ class HybridEngineRolloutConfig:
     max_context_len: Optional[int] = None
     # Extra arguments for ``tokenizer.apply_chat_template``, e.g. {"enable_thinking": False} for Qwen3.
     chat_template_kwargs: dict = field(default_factory=dict)
+    # Format of the model's tool calls, a key of TOOL_CALL_PARSERS: "hermes" (Qwen2.5, Qwen3) or
+    # "qwen3_coder" (Qwen3-Coder, Qwen3.5).
+    tool_call_parser: str = "hermes"
 
     def __post_init__(self) -> None:
         if self.multi_turn and not self.max_turns:
             raise ValueError("Max turns not specified when using multi-turn rollout")
+        if self.tool_call_parser not in TOOL_CALL_PARSERS:
+            raise ValueError(f"unknown tool_call_parser {self.tool_call_parser!r}; "
+                             f"choose from {', '.join(TOOL_CALL_PARSERS)}")
 
 
 class HybridEngineRollout(RolloutEngine):
@@ -180,6 +186,7 @@ class HybridEngineRollout(RolloutEngine):
         self.max_turns = getattr(cfg, 'max_turns', None) if cfg else None
         self.max_context_len = getattr(cfg, 'max_context_len', None) if cfg else None
         self.chat_template_kwargs = (getattr(cfg, 'chat_template_kwargs', None) if cfg else None) or {}
+        self.parse_tool_calls = TOOL_CALL_PARSERS[getattr(cfg, 'tool_call_parser', 'hermes') if cfg else 'hermes']
         self._last_profile = None
         self._last_continuous_stats = None
 
@@ -424,7 +431,7 @@ class HybridEngineRollout(RolloutEngine):
                     trajectories[i].status = Sample.Status.TRUNCATED
                     continue
                 # Keep special tokens when decoding: tool-call tags can be special tokens.
-                calls = parse_hermes_tool_calls(self.tokenizer.decode(response))
+                calls = self.parse_tool_calls(self.tokenizer.decode(response), self.tools)
                 if not calls:
                     trajectories[i].status = Sample.Status.COMPLETED
                     continue
