@@ -8,7 +8,8 @@ Provides:
   - :class:`RolloutRequest`, :class:`RolloutBatch`, :class:`SamplingConfig` — dataclasses
   - :class:`ResponseTokenBatch` — response-only causal training targets
   - :class:`HybridEngineRollout` — concrete implementation using DeepSpeed hybrid engine
-  - :class:`Tool`, :class:`ToolSet`, :func:`parse_hermes_tool_calls` — tools for multi-turn rollout
+  - :class:`Tool`, :class:`ToolSet`, :func:`parse_hermes_tool_calls`, :func:`parse_qwen3_coder_tool_calls` — tools
+    for multi-turn rollout
   - :func:`build_rollout` — factory that selects the engine from config
 """
 
@@ -21,7 +22,7 @@ from deepspeed.runtime.rollout.base import (
 )
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout
 from deepspeed.runtime.rollout.opsd import JSDLossOutput, ResponseTokenBatch, generalized_jsd_loss
-from deepspeed.runtime.rollout.tool import Tool, ToolCall, ToolSet, parse_hermes_tool_calls
+from deepspeed.runtime.rollout.tool import Tool, ToolCall, ToolSet, parse_hermes_tool_calls, parse_qwen3_coder_tool_calls
 
 __all__ = [
     "HybridEngineRollout",
@@ -38,6 +39,7 @@ __all__ = [
     "build_rollout",
     "generalized_jsd_loss",
     "parse_hermes_tool_calls",
+    "parse_qwen3_coder_tool_calls",
 ]
 
 
