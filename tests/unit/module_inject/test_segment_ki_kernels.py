@@ -2,7 +2,7 @@
 # DeepSpeed Team
 """Contract tests for segment-KI kernels and rollout co-location.
 
-Three groups:
+Four groups:
 
 1. Kernel vs reference consistency (GPU): every fused_glu CUDA kernel must
    match its pure-PyTorch specification in kernel_reference.py within bf16
@@ -15,6 +15,9 @@ Three groups:
    availability): the RL-loop contract — generate, take one optimizer
    step through the injected model, generate again, and observe different
    output — with no inject/eject/sync calls anywhere in between.
+4. transformers API compatibility (GPU): the injected forwards must keep
+   matching the native model across transformers releases that lay out
+   the model internals differently.
 """
 
 import os
@@ -441,3 +444,58 @@ class TestRolloutTrainRollout:
 
         # still exercise the post-training generate path end-to-end
         rollout.generate(req, greedy)
+
+
+# ---------------------------------------------------------------------------
+# 4. transformers API compatibility (GPU)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not GPU_AVAILABLE, reason="non-CPU device required")
+class TestGDNScanKernelFallback:
+    """The fused GDN forward must find the delta-rule scan kernels whether
+    transformers binds them onto each layer (older releases) or only exposes
+    the module-level torch_*_gated_delta_rule functions (newer releases)."""
+
+    def test_prefill_and_decode_match_native_without_bound_scan_kernels(self):
+        modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+        from deepspeed.module_inject.segment_ki import apply_segment_ki
+
+        torch.manual_seed(0)
+        config = Qwen3_5TextConfig(vocab_size=128,
+                                   hidden_size=128,
+                                   intermediate_size=256,
+                                   num_hidden_layers=2,
+                                   layer_types=["linear_attention", "full_attention"],
+                                   num_attention_heads=4,
+                                   num_key_value_heads=2,
+                                   head_dim=64,
+                                   linear_num_key_heads=2,
+                                   linear_num_value_heads=4,
+                                   linear_key_head_dim=32,
+                                   linear_value_head_dim=32)
+        config._attn_implementation = "sdpa"
+        model = modeling.Qwen3_5ForCausalLM(config).to(DEV, torch.bfloat16).eval()
+        # Model the newer transformers layout on any release: no per-layer scan kernels.
+        for module in model.modules():
+            for name in ("chunk_gated_delta_rule", "recurrent_gated_delta_rule"):
+                module.__dict__.pop(name, None)
+
+        prompt = torch.randint(0, config.vocab_size, (1, 9), device=DEV)
+        next_token = torch.randint(0, config.vocab_size, (1, 1), device=DEV)
+
+        def prefill_and_decode():
+            with torch.no_grad():
+                prefill = model(prompt, use_cache=True)  # chunked scan
+                decode = model(next_token, past_key_values=prefill.past_key_values, use_cache=True)  # recurrent scan
+            return prefill.logits[:, -1].float(), decode.logits[:, -1].float()
+
+        expected = prefill_and_decode()
+        report = apply_segment_ki(model)
+        assert report["fused_gdn"]["segments_replaced"] == 1
+        actual = prefill_and_decode()
+
+        for step, a, e in zip(("prefill", "decode"), actual, expected):
+            rel_err = (a - e).norm() / e.norm()
+            assert rel_err < 3e-2, f"{step} logits differ from the native model: relative error {rel_err:.3f}"

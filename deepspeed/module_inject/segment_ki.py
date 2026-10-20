@@ -399,8 +399,11 @@ def _install_gdn_segment(seg: GDNSegment) -> bool:
         # (recurrent_gated_delta_rule/chunk_gated_delta_rule) and only falls
         # back to the pure-torch references otherwise. Calling the module-level
         # torch_* functions directly forces the slow fallback on every layer.
+        # Newer transformers bind nothing on the module; their module-level
+        # torch_* functions already resolve to the FLA implementation.
         single = kw.get("initial_state") is not None and query.shape[1] == 1
-        fn = parent.recurrent_gated_delta_rule if single else parent.chunk_gated_delta_rule
+        name = "recurrent_gated_delta_rule" if single else "chunk_gated_delta_rule"
+        fn = getattr(parent, name, None) or getattr(m5, f"torch_{name}")
         return fn(query, key, value, **kw)
 
     parent._ki_gdn_op = _load_native_op()
