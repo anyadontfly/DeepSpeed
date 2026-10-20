@@ -4,7 +4,8 @@
 """Unit tests for HybridEngineRollout.
 
 Most tests are CPU-only; the native shared-prefill cache test runs only when CUDA and
-the transformer inference extension are available.
+the transformer inference extension are available, and the graph-capture sampling test
+only when CUDA is available.
 """
 
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from deepspeed.runtime.rollout.base import RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     HybridEngineRollout,
     HybridEngineRolloutConfig,
+    _next_token,
 )
 from deepspeed.utils.static_cache import DeepSpeedStaticCache
 
@@ -930,6 +932,82 @@ def test_generate_disables_top_k_for_sampling(top_k):
     rollout.generate(request, SamplingConfig(max_new_tokens=1, temperature=0.7, top_k=top_k))
 
     assert engine.module.generate.call_args.kwargs["top_k"] == 0
+
+
+@pytest.mark.parametrize("sampling", [None, SamplingConfig(max_new_tokens=1, temperature=0)])
+def test_next_token_greedy_returns_argmax(sampling):
+    logits = torch.tensor([[0.1, 2.0, 0.3], [5.0, -1.0, 4.9]])
+
+    assert _next_token(logits, sampling).tolist() == [[1], [0]]
+
+
+def test_next_token_samples_when_temperature_is_positive():
+    torch.manual_seed(0)
+    # Two equally likely tokens per row; the remaining ones can never be drawn.
+    logits = torch.full((512, 6), float("-inf"))
+    logits[:, 2] = 0.0
+    logits[:, 4] = 0.0
+
+    tokens = _next_token(logits, SamplingConfig(max_new_tokens=1, temperature=1.0))
+
+    assert tokens.shape == (512, 1)
+    assert set(tokens.view(-1).tolist()) == {2, 4}
+
+
+def _tiny_llama(device):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size=64,
+                         hidden_size=64,
+                         intermediate_size=128,
+                         num_hidden_layers=2,
+                         num_attention_heads=4,
+                         num_key_value_heads=2,
+                         max_position_embeddings=64)
+    return LlamaForCausalLM(config).to(device).eval()
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_graph_generation_samples_when_temperature_is_positive(batch_size):
+    """The graph path must sample every token (including the first, read off
+    the prefill) when temperature > 0, and stay greedy at temperature 0."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("CUDA graph capture requires CUDA")
+
+    device = torch.device("cuda")
+    module = _tiny_llama(device)
+    tok = MagicMock()
+    tok.eos_token_id = -1  # never generated: every row decodes all tokens
+    rollout = HybridEngineRollout(_make_engine(), tok, HybridEngineRolloutConfig(use_graph_capture=True))
+    prompt_ids = torch.tensor([[5, 9, 13, 17]], device=device).repeat(batch_size, 1)
+    prompt_attn = torch.ones_like(prompt_ids)
+    max_new_tokens = 8
+
+    def run(sampling):
+        # Keep the optional native step kernel out of the test.
+        with patch("deepspeed.ops.module_inject.get_fused_glu_op", side_effect=ImportError):
+            with torch.no_grad():
+                return rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, module, device,
+                                               sampling)[:, prompt_ids.shape[1]:]
+
+    greedy = run(SamplingConfig(max_new_tokens=max_new_tokens, temperature=0))
+    with torch.no_grad():
+        reference = module.generate(prompt_ids,
+                                    attention_mask=prompt_attn,
+                                    max_new_tokens=max_new_tokens,
+                                    do_sample=False,
+                                    pad_token_id=0)[:, prompt_ids.shape[1]:]
+    assert torch.equal(greedy, reference)
+
+    torch.manual_seed(1)
+    sampled = run(SamplingConfig(max_new_tokens=max_new_tokens, temperature=1.0))
+    assert sampled.shape == greedy.shape
+    # A random-init model is close to uniform over 64 tokens, so a sampled row
+    # equal to the greedy row (or 8 identical sampled first tokens) is ~1e-14.
+    assert not torch.equal(sampled, greedy)
+    if batch_size > 1:
+        assert sampled[:, 0].unique().numel() > 1
 
 
 def test_pad_after_eos_handles_different_lengths_and_missing_eos():

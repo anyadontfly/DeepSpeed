@@ -123,6 +123,14 @@ def _sample_from_logits(logits, sampling):
     return torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
 
 
+def _next_token(logits, sampling):
+    """Pick the next token per row from last-position logits [batch, vocab]:
+    argmax when greedy (no sampling config or temperature <= 0), else sample."""
+    if sampling is None or sampling.temperature <= 0.0:
+        return logits.argmax(dim=-1, keepdim=True)
+    return _sample_from_logits(logits, sampling)
+
+
 class HybridEngineRollout(RolloutEngine):
     """Rollout engine using DeepSpeed hybrid engine.
 
@@ -1034,14 +1042,19 @@ class HybridEngineRollout(RolloutEngine):
         return output_ids, response_attn.long()
 
     # ------------------------------------------------------------------
-    # Graph capture decode loop (greedy only)
+    # Graph capture decode loop
     # ------------------------------------------------------------------
 
     def _generate_graph(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, module, device, sampling=None):
-        """Greedy decode with DeepSpeedStaticCache + CUDA graph capture."""
+        """Decode with DeepSpeedStaticCache + CUDA graph capture.
+
+        The graph holds the forward pass; token selection (argmax or
+        temperature/top-k/top-p sampling) runs outside it, except for the
+        greedy b=1 full-step kernel, which folds argmax into the graph."""
         from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache
 
+        is_greedy = sampling is None or sampling.temperature <= 0.0
         batch_size = prompt_ids.shape[0]
         prompt_len = prompt_ids.shape[1]
         max_len = prompt_len + max_new_tokens
@@ -1065,7 +1078,7 @@ class HybridEngineRollout(RolloutEngine):
             # model/cache combinations (reproduced with LLaMA + StaticCache)
             cache_position=torch.arange(prompt_len, device=device),
         )
-        next_token = prefill_out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        next_token = _next_token(prefill_out.logits[:, -1, :], sampling)
 
         # --- Copy prefill KV into DeepSpeedStaticCache ---
         # per-row positions: the batched step and decode-attention kernels
@@ -1223,7 +1236,6 @@ class HybridEngineRollout(RolloutEngine):
                 # argmax + buffer updates outside the graph. The kernel also
                 # only accepts CUDA bf16 logits — fp16 models must keep the
                 # PyTorch argmax path instead of failing during capture.
-                is_greedy = sampling is None or sampling.temperature <= 0.0
                 if (graph_op is not None and is_greedy and static_logits.dtype is torch.bfloat16
                         and get_accelerator().on_accelerator(static_logits)):
                     graph_op.decode_step_graph(static_logits[:, -1, :].contiguous(), static_token.view(batch_size, 1),
@@ -1244,11 +1256,11 @@ class HybridEngineRollout(RolloutEngine):
 
         # --- Decode loop: full-step graph (b=1) > graph+Python (b>1) > Python loop ---
         if graph is not None and batch_size > 1:
-            # Graph forward + Python argmax for b>1: the graph eliminates kernel
-            # launch overhead for the forward pass; argmax and buffer updates
-            # stay in Python (PyTorch argmax is batch-native).  The Python
-            # overhead (~50us/step) is a smaller fraction of the larger GPU
-            # workload at higher batch.
+            # Graph forward + Python token selection for b>1: the graph
+            # eliminates kernel launch overhead for the forward pass; argmax or
+            # sampling and buffer updates stay in Python (both batch-native).
+            # The Python overhead (~50us/step) is a smaller fraction of the
+            # larger GPU workload at higher batch.
             eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
             for step in range(max_new_tokens - 1):
                 if eos_mask.all():
@@ -1262,7 +1274,7 @@ class HybridEngineRollout(RolloutEngine):
                 # b>1 attends every slot the mask reveals.
                 static_attn[:, :, :, pos] = True
                 get_accelerator().replay_graph(graph)
-                next_token = static_logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                next_token = _next_token(static_logits[:, -1, :], sampling)
                 output_ids.append(next_token)
                 eos_mask |= (next_token.view(batch_size) == eos_token_id)
             return torch.cat(output_ids, dim=1)
@@ -1299,10 +1311,7 @@ class HybridEngineRollout(RolloutEngine):
             write_pos.fill_(pos)
             static_attn[:, :, :, pos] = True
             get_accelerator().replay_graph(graph)
-            if is_greedy:
-                next_token = static_logits[:, -1, :].argmax(dim=-1, keepdim=True)
-            else:
-                next_token = _sample_from_logits(static_logits[:, -1, :], sampling)
+            next_token = _next_token(static_logits[:, -1, :], sampling)
             output_ids.append(next_token)
             eos_mask |= (next_token.view(1) == eos_token_id)
         return torch.cat(output_ids, dim=1)
