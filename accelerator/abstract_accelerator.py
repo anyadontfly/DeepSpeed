@@ -228,6 +228,10 @@ class DeepSpeedAccelerator(ABC):
     def replay_graph(self, graph):
         ...
 
+    def is_stream_capturing(self):
+        """True while the current stream is capturing a graph; backends without graph capture never are."""
+        return False
+
     # Tensor operations
     @property
     @abc.abstractmethod

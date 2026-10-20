@@ -296,6 +296,9 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         graph.replay()
         return
 
+    def is_stream_capturing(self):
+        return torch.cuda.is_current_stream_capturing()
+
     # Tensor operations
 
     @property

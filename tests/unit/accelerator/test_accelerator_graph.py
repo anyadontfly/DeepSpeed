@@ -41,6 +41,30 @@ def test_graph_capture_replay_roundtrip():
     assert dst.item() == 1.0
 
 
+def test_is_stream_capturing_tracks_graph_capture():
+    # Every accelerator answers is_stream_capturing() (DeepSpeedStaticCache
+    # calls it on each per-row cache update); outside a capture it is False.
+    accel = get_accelerator()
+    assert accel.is_stream_capturing() is False
+
+    graph = accel.create_graph()
+    if graph is None or accel.device_name() != "cuda":
+        pytest.skip(f"{accel.device_name()} accelerator does not report graph capture")
+    buf = torch.zeros(1, device=accel.device_name())
+    stream = accel.Stream()
+    stream.wait_stream(accel.current_stream())
+    with accel.stream(stream):
+        buf.add_(1.0)
+    accel.current_stream().wait_stream(stream)
+
+    seen = []
+    with accel.capture_to_graph(graph):
+        buf.add_(1.0)
+        seen.append(accel.is_stream_capturing())
+    assert seen == [True]
+    assert accel.is_stream_capturing() is False
+
+
 def test_graph_ops_run_eagerly_without_graph_support():
     # Backends without graph support must run capture bodies eagerly and treat
     # replay as a no-op, keeping graph_process correct when capture is off.
