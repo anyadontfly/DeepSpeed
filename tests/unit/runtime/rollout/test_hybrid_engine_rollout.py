@@ -1367,6 +1367,61 @@ def test_generate_disables_top_k_for_sampling(top_k):
     assert engine.module.generate.call_args.kwargs["top_k"] == 0
 
 
+def _tiny_llama(device):
+    from transformers import LlamaConfig, LlamaForCausalLM
+
+    torch.manual_seed(0)
+    config = LlamaConfig(vocab_size=64,
+                         hidden_size=64,
+                         intermediate_size=128,
+                         num_hidden_layers=2,
+                         num_attention_heads=4,
+                         num_key_value_heads=2,
+                         max_position_embeddings=64)
+    return LlamaForCausalLM(config).to(device).eval()
+
+
+@pytest.mark.parametrize("batch_size", [1, 8])
+def test_graph_generation_matches_hf_greedy_and_samples_with_temperature(batch_size):
+    """The graph path must match HF generate at temperature 0 and sample every
+    token (including the first, read off the prefill) when temperature > 0."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("CUDA graph capture requires CUDA")
+
+    device = torch.device("cuda")
+    module = _tiny_llama(device)
+    tok = MagicMock()
+    tok.eos_token_id = -1  # never generated: every row decodes all tokens
+    rollout = HybridEngineRollout(_make_engine(), tok, HybridEngineRolloutConfig(use_graph_capture=True))
+    prompt_ids = torch.tensor([[5, 9, 13, 17]], device=device).repeat(batch_size, 1)
+    prompt_attn = torch.ones_like(prompt_ids)
+    max_new_tokens = 8
+
+    def run(temperature):
+        with torch.no_grad():
+            output_ids, _ = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, temperature, module,
+                                                    device)
+        return output_ids[:, prompt_ids.shape[1]:]
+
+    greedy = run(0.0)
+    with torch.no_grad():
+        reference = module.generate(prompt_ids,
+                                    attention_mask=prompt_attn,
+                                    max_new_tokens=max_new_tokens,
+                                    do_sample=False,
+                                    pad_token_id=0)[:, prompt_ids.shape[1]:]
+    assert torch.equal(greedy, reference)
+
+    torch.manual_seed(1)
+    sampled = run(1.0)
+    assert sampled.shape == greedy.shape
+    # A random-init model is close to uniform over 64 tokens, so a sampled row
+    # equal to the greedy row (or 8 identical sampled first tokens) is ~1e-14.
+    assert not torch.equal(sampled, greedy)
+    if batch_size > 1:
+        assert sampled[:, 0].unique().numel() > 1
+
+
 def test_pad_after_eos_handles_different_lengths_and_missing_eos():
     output_ids = torch.tensor([
         [10, 11, 2, 7, 8, 9],
