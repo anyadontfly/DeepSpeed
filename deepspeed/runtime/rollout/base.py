@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 
+from deepspeed.runtime.rollout.tool import TOOL_CALL_PARSERS
+
 
 @dataclass
 class RolloutConfig:
@@ -27,10 +29,16 @@ class RolloutConfig:
     max_context_len: Optional[int] = None
     # Extra arguments for ``tokenizer.apply_chat_template``, e.g. {"enable_thinking": False} for Qwen3.
     chat_template_kwargs: dict = field(default_factory=dict)
+    # Format of the model's tool calls, a key of TOOL_CALL_PARSERS: "hermes" (Qwen2.5, Qwen3) or
+    # "qwen3_coder" (Qwen3-Coder, Qwen3.5).
+    tool_call_parser: str = "hermes"
 
     def __post_init__(self) -> None:
         if self.multi_turn and not self.max_turns:
             raise ValueError("max_turns must be set when multi_turn is enabled")
+        if self.tool_call_parser not in TOOL_CALL_PARSERS:
+            raise ValueError(f"unknown tool_call_parser {self.tool_call_parser!r}; "
+                             f"choose from {', '.join(TOOL_CALL_PARSERS)}")
 
 
 @dataclass
