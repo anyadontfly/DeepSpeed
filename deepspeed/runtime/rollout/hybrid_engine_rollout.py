@@ -572,18 +572,14 @@ class HybridEngineRollout(RolloutEngine):
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
         if self.use_graph_capture:
-            # The graph path prefills hybrid models without a mask, since GDN layers must not get one, so pad tokens
-            # would enter their recurrent state. Padded prompts on those models use HF generate, which masks them.
-            padded_hybrid = _has_linear_attention(module.config) and bool((prompt_attn == 0).any().item())
-            if not padded_hybrid:
-                return self._generate_graph(prompt_ids,
-                                            prompt_attn,
-                                            max_new_tokens,
-                                            pad_token_id,
-                                            sampling.temperature,
-                                            module,
-                                            prompt_ids.device,
-                                            return_log_probs=sampling.return_log_probs)
+            return self._generate_graph(prompt_ids,
+                                        prompt_attn,
+                                        max_new_tokens,
+                                        pad_token_id,
+                                        sampling.temperature,
+                                        module,
+                                        prompt_ids.device,
+                                        return_log_probs=sampling.return_log_probs)
 
         # ZeRO-3 gathers parameters during each decode forward, so every
         # data-parallel rank must run the same number of decode steps and
@@ -1628,6 +1624,76 @@ class HybridEngineRollout(RolloutEngine):
     # Graph capture decode loop
     # ------------------------------------------------------------------
 
+    def _prefill_hybrid_rows(self, module, prompt_ids, row_lengths, ds_cache, logits_kwargs, model_dtype, device):
+        """Prefill a hybrid model's left-padded prompts without their padding; returns the last-position logits.
+
+        GDN layers fold every input token into their recurrent state and have no way to skip pad tokens, so each
+        group of equally long rows is prefilled on its own, unpadded, into a prompt-sized HF cache. The groups'
+        full-attention KV lands in slots ``0..len-1`` of ``ds_cache``, and their GDN states in one batched
+        linear-attention cache that the GDN slots of ``ds_cache`` adopt.
+        """
+        from transformers import StaticCache
+        from deepspeed.utils.static_cache import DSStaticGDNSlot
+
+        batch_size, prompt_len = prompt_ids.shape
+        # Only the linear-attention layers of this cache are used, so its full-attention layers get one slot.
+        gdn_cache = self._create_static_cache(StaticCache, module.config, batch_size, 1, device, model_dtype)
+        last_logits = None
+        lengths = row_lengths.tolist()
+        for length in sorted(set(lengths)):
+            group = torch.tensor([row for row, n in enumerate(lengths) if n == length], device=device)
+            group_cache = self._create_static_cache(StaticCache, module.config, group.numel(), length, device,
+                                                    model_dtype)
+            prefill_out = module(
+                prompt_ids[group, prompt_len - length:],
+                # GDN layers must see None (a 2-D mask corrupts their conv-state init); these rows have no padding.
+                attention_mask={
+                    "full_attention": None,
+                    "linear_attention": None
+                },
+                past_key_values=group_cache,
+                use_cache=True,
+                cache_position=torch.arange(length, device=device),
+                **logits_kwargs,
+            )
+            if last_logits is None:
+                last_logits = prefill_out.logits.new_empty(batch_size, prefill_out.logits.shape[-1])
+            last_logits[group] = prefill_out.logits[:, -1, :]
+
+            for layer_idx, ds_layer in enumerate(ds_cache.layers):
+                if isinstance(ds_layer, DSStaticGDNSlot):
+                    self._copy_gdn_rows(group_cache.layers[layer_idx], gdn_cache.layers[layer_idx], group, batch_size)
+                    continue
+                hf_keys, hf_values = self._cache_layer_tensors(group_cache, layer_idx)
+                if not ds_layer.is_initialized:
+                    ds_layer.lazy_initialization(hf_keys.new_empty(batch_size, *hf_keys.shape[1:]),
+                                                 hf_values.new_empty(batch_size, *hf_values.shape[1:]))
+                ds_layer.keys[group, :, :length, :] = hf_keys
+                ds_layer.values[group, :, :length, :] = hf_values
+            # Its rows are copied out; dropping the group's cache frees its KV before the next group runs.
+            del prefill_out, group_cache
+
+        for layer_idx, ds_layer in enumerate(ds_cache.layers):
+            if isinstance(ds_layer, DSStaticGDNSlot):
+                gdn_cache.layers[layer_idx].has_previous_state[0] = True
+                ds_layer.bind(gdn_cache.layers[layer_idx])
+        return last_logits
+
+    @staticmethod
+    def _copy_gdn_rows(group_slot, batch_slot, group, batch_size):
+        """Copy a prefill group's conv and recurrent states into rows ``group`` of the batch's GDN slot."""
+        if group_slot.is_conv_states_initialized[0]:
+            if not batch_slot.is_conv_states_initialized[0]:
+                conv_states = group_slot.conv_states[0]
+                batch_slot.lazy_initialization(conv_states=conv_states.new_zeros(batch_size, *conv_states.shape[1:]))
+            batch_slot.conv_states[0][group] = group_slot.conv_states[0]
+        if group_slot.is_recurrent_states_initialized[0]:
+            if not batch_slot.is_recurrent_states_initialized[0]:
+                recurrent_states = group_slot.recurrent_states[0]
+                batch_slot.lazy_initialization(
+                    recurrent_states=recurrent_states.new_zeros(batch_size, *recurrent_states.shape[1:]))
+            batch_slot.recurrent_states[0][group] = group_slot.recurrent_states[0]
+
     def _generate_graph(self,
                         prompt_ids,
                         prompt_attn,
@@ -1645,8 +1711,12 @@ class HybridEngineRollout(RolloutEngine):
         is greedy decoding of a single row without log-probs, where segment-KI's
         step kernel picks each token inside the graph; that path returns
         ``log_probs=None``.
+
+        Hybrid models keep each row unpadded: its prompt fills cache slots
+        ``0..len-1`` and it decodes from its own length, since GDN layers cannot
+        mask pad tokens out of their recurrent state. Other models keep the
+        left-padded layout and mask the pad slots.
         """
-        from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache, DSStaticGDNSlot
 
         batch_size = prompt_ids.shape[0]
@@ -1655,6 +1725,7 @@ class HybridEngineRollout(RolloutEngine):
         eos_token_id = self.tokenizer.eos_token_id
         model_dtype = next(module.parameters()).dtype
         is_hybrid = _has_linear_attention(module.config)
+        rows = torch.arange(batch_size, device=device)
 
         ds_cache = DeepSpeedStaticCache(
             module.config,
@@ -1666,35 +1737,12 @@ class HybridEngineRollout(RolloutEngine):
         # Only the last position picks the first token; full prefill logits are [batch, prompt_len, vocab].
         logits_kwargs = {"logits_to_keep": 1} if "logits_to_keep" in signature(module.forward).parameters else {}
         if is_hybrid:
-            # --- Prefill into a prompt-sized HF cache, then hand its state over ---
-            # The GDN slots wrap HF's linear-attention layers, which are cudagraph-safe by construction, so they
-            # adopt the prefill cache's layers by reference; the full-attention KV is copied into the DeepSpeed cache.
-            prefill_cache = self._create_static_cache(StaticCache, module.config, batch_size, prompt_len, device,
-                                                      model_dtype)
-            prefill_out = module(
-                prompt_ids,
-                # GDN layers must see None (a 2-D mask corrupts their conv-state init), so padded prompts on hybrid
-                # models take module.generate instead of this path.
-                attention_mask={
-                    "full_attention": None,
-                    "linear_attention": None
-                },
-                past_key_values=prefill_cache,
-                use_cache=True,
-                cache_position=torch.arange(prompt_len, device=device),
-                **logits_kwargs,
-            )
-            for layer_idx, ds_layer in enumerate(ds_cache.layers):
-                if isinstance(ds_layer, DSStaticGDNSlot):
-                    ds_layer.bind(prefill_cache.layers[layer_idx])
-                    continue
-                hf_keys, hf_values = self._cache_layer_tensors(prefill_cache, layer_idx)
-                if not ds_layer.is_initialized:
-                    ds_layer.lazy_initialization(hf_keys, hf_values)
-                ds_layer.keys[:, :, :prompt_len, :].copy_(hf_keys)
-                ds_layer.values[:, :, :prompt_len, :].copy_(hf_values)
-            # The GDN slots hold on to the linear-attention layers; dropping the cache frees its copy of the KV.
-            del prefill_cache
+            row_lengths = prompt_attn.sum(dim=1)
+            prefill_logits = self._prefill_hybrid_rows(module, prompt_ids, row_lengths, ds_cache, logits_kwargs,
+                                                       model_dtype, device)
+            # Each row's first decode slot is right after its own prompt; its prompt slots are all real tokens.
+            decode_start = row_lengths
+            prompt_slots = torch.arange(prompt_len, device=device).unsqueeze(0) < row_lengths.unsqueeze(1)
         else:
             # --- Prefill straight into the cache the graph decodes from ---
             # A second full-length cache for the prefill alone would double the KV memory of the call.
@@ -1711,14 +1759,18 @@ class HybridEngineRollout(RolloutEngine):
                 position_ids=torch.arange(prompt_len, device=device).expand(batch_size, -1),
                 **logits_kwargs,
             )
-        next_token, first_log_probs = _select_next_tokens(prefill_out.logits[:, -1, :], temperature)
+            prefill_logits = prefill_out.logits[:, -1, :]
+            # Left-padded rows all decode from the end of the padded prompt; the mask hides their pad slots.
+            decode_start = torch.full((batch_size, ), prompt_len, dtype=torch.long, device=device)
+            prompt_slots = prompt_attn.bool()
+        next_token, first_log_probs = _select_next_tokens(prefill_logits, temperature)
         log_probs = [first_log_probs]
 
         output_ids = [prompt_ids, next_token]
 
         # Decoding writes one slot per row per step. Positions are per row because segment-KI's batched decode
-        # kernels advance one entry per sequence.
-        write_pos = torch.full((batch_size, ), prompt_len, dtype=torch.long, device=device)
+        # kernels advance one entry per sequence, and rows of a hybrid model start from their own lengths.
+        write_pos = decode_start.clone()
         ds_cache.set_write_position(write_pos)
 
         # --- Static buffers for graph capture ---
@@ -1727,8 +1779,8 @@ class HybridEngineRollout(RolloutEngine):
         # (graph-replay safe). GDN layers must receive None: their recurrence ignores attention masks and a
         # non-None value corrupts the conv-state updates.
         static_attn = torch.zeros(batch_size, 1, 1, max_len, dtype=torch.bool, device=device)
-        static_attn[:, :, :, :prompt_len] = prompt_attn.unsqueeze(1).unsqueeze(1).bool()
-        static_attn[:, :, :, prompt_len] = True
+        static_attn[:, 0, 0, :prompt_len] = prompt_slots
+        static_attn[rows, 0, 0, decode_start] = True
         decode_mask = {"full_attention": static_attn, "linear_attention": None} if is_hybrid else static_attn
         # Views of write_pos, not copies: the captured forwards read this memory, and the in-graph step kernel
         # advances write_pos itself, so replays see the new position without host-side updates.
@@ -1836,7 +1888,7 @@ class HybridEngineRollout(RolloutEngine):
             # The capture run consumed static_token: restore the GDN states and the write position, whether or
             # not the step kernel was mounted, so decoding starts from the state right after prefill.
             restore_gdn_states()
-            write_pos.fill_(prompt_len)
+            write_pos.copy_(decode_start)
             static_token.copy_(next_token)
         finally:
             module._forward_pre_hooks.update(saved_pre)
@@ -1862,19 +1914,19 @@ class HybridEngineRollout(RolloutEngine):
             return torch.cat([prompt_ids, generated_ids], dim=1), None
 
         # --- Decode loop ---
-        eos_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        # Checking for EOS reads the device from the host, which stalls the queued steps, so it runs every few
+        # steps. Rows that end in between keep decoding; callers cut each response at its first EOS.
+        eos_check_every = 16
+        eos_mask = next_token.squeeze(1) == eos_token_id
         for step in range(max_new_tokens - 1):
-            if eos_mask.all():
-                output_ids.append(torch.full((batch_size, 1), pad_token_id, dtype=torch.long, device=device))
-                log_probs.append(torch.zeros((batch_size, 1), device=device))
-                continue
+            if step % eos_check_every == 0 and bool(eos_mask.all().item()):
+                break
 
             # Update static inputs. Only the current token's own slot is revealed: later slots still hold warmup
             # and capture leftovers.
             static_token.copy_(next_token)
-            pos = prompt_len + step
-            write_pos.fill_(pos)
-            static_attn[:, :, :, pos] = True
+            torch.add(decode_start, step, out=write_pos)
+            static_attn[rows, 0, 0, write_pos] = True
 
             # Replay
             get_accelerator().replay_graph(graph)
@@ -1883,6 +1935,11 @@ class HybridEngineRollout(RolloutEngine):
             log_probs.append(step_log_probs)
             eos_mask |= (next_token.squeeze(1) == eos_token_id)
 
+        # Every row ended: the rest of the response is padding.
+        remaining = max_new_tokens - (len(output_ids) - 1)
+        if remaining > 0:
+            output_ids.append(torch.full((batch_size, remaining), pad_token_id, dtype=torch.long, device=device))
+            log_probs.append(torch.zeros((batch_size, remaining), device=device))
         return torch.cat(output_ids, dim=1), torch.cat(log_probs, dim=1)
 
     def sync_weights(self, step: int) -> None:  # noqa: ARG002

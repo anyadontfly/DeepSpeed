@@ -1570,6 +1570,74 @@ def test_graph_generation_matches_hf_greedy_and_samples_with_temperature(batch_s
         assert sampled[:, 0].unique().numel() > 1
 
 
+def _tiny_qwen3_5(device, dtype):
+    """A random hybrid model: GDN (linear-attention) layers interleaved with full-attention layers."""
+    modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    torch.manual_seed(0)
+    config = Qwen3_5TextConfig(vocab_size=128,
+                               hidden_size=128,
+                               intermediate_size=256,
+                               num_hidden_layers=4,
+                               layer_types=["linear_attention", "full_attention"] * 2,
+                               num_attention_heads=4,
+                               num_key_value_heads=2,
+                               head_dim=64,
+                               linear_num_key_heads=2,
+                               linear_num_value_heads=4,
+                               linear_key_head_dim=32,
+                               linear_value_head_dim=32)
+    config._attn_implementation = "sdpa"
+    return modeling.Qwen3_5ForCausalLM(config).to(device, dtype).eval()
+
+
+def _left_pad(prompts, device):
+    width = max(len(prompt) for prompt in prompts)
+    prompt_ids = torch.zeros(len(prompts), width, dtype=torch.long, device=device)
+    prompt_attn = torch.zeros_like(prompt_ids)
+    for row, prompt in enumerate(prompts):
+        prompt_ids[row, width - len(prompt):] = torch.tensor(prompt, device=device)
+        prompt_attn[row, width - len(prompt):] = 1
+    return prompt_ids, prompt_attn
+
+
+@pytest.mark.parametrize("dtype, use_segki", [(torch.float32, False), (torch.bfloat16, True)])
+def test_graph_capture_decodes_left_padded_hybrid_rows_as_if_alone(dtype, use_segki):
+    """GDN layers have no way to skip pad tokens, so a left-padded row of a hybrid model must decode as it
+    would alone and unpadded: same sampled-token log-probs and, at temperature 0, the same tokens."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("CUDA graph capture requires CUDA")
+    device = torch.device("cuda")
+    model = _tiny_qwen3_5(device, dtype)
+    # An EOS id that is never generated keeps every row decoding to max_new_tokens.
+    rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=-1),
+                                  HybridEngineRolloutConfig(use_graph_capture=True, use_segki=use_segki))
+    torch.manual_seed(1)
+    prompts = [torch.randint(1, 128, (length, )).tolist() for length in (9, 5, 7, 9, 3)]
+    prompt_ids, prompt_attn = _left_pad(prompts, device)
+    width, max_new_tokens, temperature = prompt_ids.shape[1], 6, 0.8
+
+    with torch.no_grad():
+        output_ids, log_probs = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, temperature, model,
+                                                        device)
+        responses = output_ids[:, width:]
+        for row, prompt in enumerate(prompts):
+            # Oracle: a plain forward over the row alone, unpadded, scored the way training scores it.
+            sequence = torch.cat((torch.tensor(prompt, device=device), responses[row])).unsqueeze(0)
+            logits = model(sequence).logits[0, len(prompt) - 1:-1].float()
+            expected = torch.log_softmax(logits / temperature, dim=-1).gather(1, responses[row].unsqueeze(1))
+            atol = 1e-3 if dtype == torch.float32 else 5e-2
+            torch.testing.assert_close(log_probs[row], expected.squeeze(1), atol=atol, rtol=0)
+
+        if dtype == torch.float32:
+            greedy, _ = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, 0.0, model, device)
+            for row, prompt in enumerate(prompts):
+                alone = torch.tensor([prompt], device=device)
+                reference = model.generate(alone, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=0)
+                assert greedy[row, width:].tolist() == reference[0, len(prompt):].tolist(), f"row {row}"
+
+
 def test_pad_after_eos_handles_different_lengths_and_missing_eos():
     output_ids = torch.tensor([
         [10, 11, 2, 7, 8, 9],
