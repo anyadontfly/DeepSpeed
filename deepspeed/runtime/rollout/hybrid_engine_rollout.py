@@ -28,7 +28,7 @@ from typing import Optional
 import torch
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRecord, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
 from deepspeed.runtime.rollout.tool import TOOL_CALL_PARSERS, ToolSet
 from deepspeed.runtime.rollout.utils import (
@@ -325,9 +325,9 @@ class HybridEngineRollout(RolloutEngine):
             response = responses[row]
             # A response that did not reach EOS was cut by max_new_tokens.
             if response and response[-1] == self.tokenizer.eos_token_id:
-                sample.status = Sample.Status.COMPLETED
+                sample.status = RolloutRecord.Status.COMPLETED
             else:
-                sample.status = Sample.Status.TRUNCATED
+                sample.status = RolloutRecord.Status.TRUNCATED
             row_log_probs = response_log_probs[row] if response_log_probs is not None else None
             update_sample_from_response(sample, response, row_log_probs, [], self.tokenizer)
 
@@ -421,7 +421,7 @@ class HybridEngineRollout(RolloutEngine):
                 if self.max_context_len is not None:
                     room[i] = min(room[i], self.max_context_len - sum(trajectories[i].attention_mask))
                 if room[i] <= 0:
-                    trajectories[i].status = Sample.Status.TRUNCATED
+                    trajectories[i].status = RolloutRecord.Status.TRUNCATED
             active = [i for i in active if room[i] > 0]
             if not active:
                 break
@@ -484,16 +484,16 @@ class HybridEngineRollout(RolloutEngine):
                 generated[i] += len(response)
                 # A turn that did not reach EOS was cut by the token or context budget.
                 if not response or response[-1] != self.tokenizer.eos_token_id:
-                    trajectories[i].status = Sample.Status.TRUNCATED
+                    trajectories[i].status = RolloutRecord.Status.TRUNCATED
                     continue
                 # Keep special tokens when decoding: tool-call tags can be special tokens.
                 calls = self.parse_tool_calls(self.tokenizer.decode(response), self.tools)
                 if not calls:
-                    trajectories[i].status = Sample.Status.COMPLETED
+                    trajectories[i].status = RolloutRecord.Status.COMPLETED
                     continue
                 # It asked for a tool but has no budget or turn left to read the result.
                 if generated[i] >= max_new_tokens or _turn == self.max_turns - 1:
-                    trajectories[i].status = Sample.Status.TRUNCATED
+                    trajectories[i].status = RolloutRecord.Status.TRUNCATED
                     continue
                 turn_calls[row] = calls
             tool_start = time.perf_counter()
@@ -656,7 +656,7 @@ class HybridEngineRollout(RolloutEngine):
                 budget = turn_budget(i)
                 if budget <= 0:
                     # No room left to generate: the trajectory ends without another turn.
-                    trajectories[i].status = Sample.Status.TRUNCATED
+                    trajectories[i].status = RolloutRecord.Status.TRUNCATED
                     continue
                 admitted.append((free_rows.pop(0), i, budget))
             if not admitted:
@@ -767,18 +767,18 @@ class HybridEngineRollout(RolloutEngine):
             log_probs = response_log_probs if sampling.return_log_probs else None
             # A turn that did not reach EOS was cut by the token or context budget.
             if not response or response[-1] != eos_token_id:
-                sample.status = Sample.Status.TRUNCATED
+                sample.status = RolloutRecord.Status.TRUNCATED
                 update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
                 return
             # Keep special tokens when decoding: tool-call tags can be special tokens.
             calls = self.parse_tool_calls(self.tokenizer.decode(response), self.tools)
             if not calls:
-                sample.status = Sample.Status.COMPLETED
+                sample.status = RolloutRecord.Status.COMPLETED
                 update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
                 return
             # It asked for a tool but has no budget or turn left to read the result.
             if generated[i] >= max_new_tokens or turn == self.max_turns - 1:
-                sample.status = Sample.Status.TRUNCATED
+                sample.status = RolloutRecord.Status.TRUNCATED
                 update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
                 return
             future = asyncio.run_coroutine_threadsafe(self._run_tool_calls({i: calls}), tool_loop)
@@ -1911,9 +1911,9 @@ class HybridEngineRollout(RolloutEngine):
         for request_id, sample in enumerate(trajectories):
             response = torch.cat(responses[request_id], dim=1)
             if self._is_eos(response[:, -1]):
-                sample.status = Sample.Status.COMPLETED
+                sample.status = RolloutRecord.Status.COMPLETED
             else:
-                sample.status = Sample.Status.TRUNCATED
+                sample.status = RolloutRecord.Status.TRUNCATED
             log_probs = None
             if return_log_probs:
                 log_probs = torch.cat(response_log_probs[request_id], dim=1)[0].tolist()

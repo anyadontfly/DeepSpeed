@@ -493,10 +493,10 @@ class TestRolloutTrainRollout:
         assert rollout._segki_report["fused_glu"]["segments_replaced"] > 0
 
         prompt_ids = tokenizer("The capital of France is").input_ids
-        from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
+        from deepspeed.runtime.rollout.base import RolloutRecord, RolloutRequest, SamplingConfig
 
         def make_request():
-            return RolloutRequest(samples=[Sample(tokens=prompt_ids, attention_mask=[1] * len(prompt_ids))])
+            return RolloutRequest(samples=[RolloutRecord(tokens=prompt_ids, attention_mask=[1] * len(prompt_ids))])
 
         greedy = SamplingConfig(max_new_tokens=24, temperature=0.0)
 

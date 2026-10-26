@@ -15,7 +15,7 @@ import torch
 from deepspeed.accelerator import get_accelerator
 
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
-from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutRecord, RolloutRequest, SamplingConfig
 
 _TINY_LLAMA = "hf-internal-testing/tiny-random-LlamaForCausalLM"
 
@@ -42,7 +42,7 @@ def test_graph_capture_standard_model():
 
     rollout = HybridEngineRollout(_Shim(model), tok, HybridEngineRolloutConfig(use_graph_capture=True))
     prompt = torch.randint(1000, 5000, (6, )).tolist()
-    req = RolloutRequest(samples=[Sample(tokens=prompt, attention_mask=[1] * len(prompt))])
+    req = RolloutRequest(samples=[RolloutRecord(tokens=prompt, attention_mask=[1] * len(prompt))])
     out = rollout.generate(req, SamplingConfig(max_new_tokens=8, temperature=0.0))
     sample = out.samples[0]
     assert sample.tokens[:6] == prompt

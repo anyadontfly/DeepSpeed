@@ -22,7 +22,7 @@ from transformers import PretrainedConfig
 from deepspeed.accelerator import get_accelerator
 from deepspeed.ops.transformer.inference.op_binding.workspace import WorkspaceOp
 from deepspeed.runtime.hybrid_engine import DeepSpeedHybridEngine
-from deepspeed.runtime.rollout.base import RolloutConfig, RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutConfig, RolloutRecord, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.tool import Tool, ToolCall, ToolSet, parse_qwen3_coder_tool_calls
 from deepspeed.runtime.rollout.hybrid_engine_rollout import (
     HybridEngineRollout,
@@ -59,7 +59,7 @@ def _prompt(tokens, attention_mask=None):
     """A pre-tokenized prompt sample; samples with tokens skip chat-template rendering."""
     if attention_mask is None:
         attention_mask = [1] * len(tokens)
-    return Sample(tokens=list(tokens), attention_mask=list(attention_mask))
+    return RolloutRecord(tokens=list(tokens), attention_mask=list(attention_mask))
 
 
 def _make_request():
@@ -508,7 +508,7 @@ def test_continuous_generation_covers_modern_static_cache_path():
     assert [sample.tokens for sample in output.samples] == [[1, 2, 3, 2], [1, 2, 4, 7, 7, 7], [1, 2, 5, 7, 7, 7]]
     assert [sample.loss_mask for sample in output.samples] == [[1], [1, 1, 1], [1, 1, 1]]
     assert [sample.status for sample in output.samples
-            ] == [Sample.Status.COMPLETED, Sample.Status.TRUNCATED, Sample.Status.TRUNCATED]
+            ] == [RolloutRecord.Status.COMPLETED, RolloutRecord.Status.TRUNCATED, RolloutRecord.Status.TRUNCATED]
     assert [sample.index for sample in output.samples] == [0, 1, 2]
     assert model.calls[0] == (2, 3)
     assert (1, 3) in model.calls
@@ -741,7 +741,8 @@ def test_continuous_generation_trims_cache_after_staggered_eos():
     output = rollout.generate(request, SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2))
 
     assert [sample.tokens[3:] for sample in output.samples] == [[2], [7, 7, 7, 7]] * 3
-    assert [sample.status for sample in output.samples] == [Sample.Status.COMPLETED, Sample.Status.TRUNCATED] * 3
+    assert [sample.status
+            for sample in output.samples] == [RolloutRecord.Status.COMPLETED, RolloutRecord.Status.TRUNCATED] * 3
 
 
 def test_continuous_generation_refills_padded_prompts_after_trim():
@@ -1328,7 +1329,7 @@ def test_multi_turn_caps_each_turn_and_the_whole_response(_tokenize_tool_respons
     assert [call.kwargs["max_new_tokens"] for call in engine.module.generate.call_args_list] == turn_budgets
     assert sample.tokens == [10, 11, _TOOL_CALL_TOKEN, 2, 9, 5]
     assert sample.loss_mask == [1, 1, 0, 1]
-    assert sample.status == Sample.Status.TRUNCATED
+    assert sample.status == RolloutRecord.Status.TRUNCATED
 
 
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=[9])
@@ -1341,7 +1342,7 @@ def test_multi_turn_per_turn_cap_resets_every_turn(_tokenize_tool_responses):
 
     assert [call.kwargs["max_new_tokens"] for call in engine.module.generate.call_args_list] == [2, 2, 2]
     assert sample.response_length == 8
-    assert sample.status == Sample.Status.COMPLETED
+    assert sample.status == RolloutRecord.Status.COMPLETED
 
 
 class _TypedTool(Tool):
@@ -1480,7 +1481,7 @@ def test_multi_turn_runs_tools_called_in_the_configured_format(tokenize_tool_res
     tool_messages = tokenize_tool_responses.call_args.args[0]
     assert [(message["name"], message["content"]) for message in tool_messages] == [("typed", "ok")]
     assert sample.tokens == [10, 11, _TOOL_CALL_TOKEN, 2, 9, 5, 2]
-    assert sample.status == Sample.Status.COMPLETED
+    assert sample.status == RolloutRecord.Status.COMPLETED
 
 
 @pytest.mark.parametrize("config_type", [HybridEngineRolloutConfig, RolloutConfig])
@@ -1523,7 +1524,7 @@ def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():
     assert sample.attention_mask == [1, 1, 1, 1]
     assert sample.loss_mask == [1, 1]
     assert sample.response_length == 2
-    assert sample.status == Sample.Status.COMPLETED
+    assert sample.status == RolloutRecord.Status.COMPLETED
 
 
 def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
@@ -1551,7 +1552,7 @@ def test_generate_forwards_top_k_for_sampling_with_multiple_samples_and_eos():
     assert [sample.loss_mask for sample in result.samples] == [[1, 1], [1, 1, 1]]
     assert [sample.group_index for sample in result.samples] == [0, 0]
     assert [sample.index for sample in result.samples] == [0, 1]
-    assert [sample.status for sample in result.samples] == [Sample.Status.COMPLETED] * 2
+    assert [sample.status for sample in result.samples] == [RolloutRecord.Status.COMPLETED] * 2
 
 
 @pytest.mark.parametrize("top_k", [-1, 0])
@@ -1739,7 +1740,7 @@ def test_generate_accepts_zero_pad_token_id():
     assert engine.module.generate.call_args.kwargs['pad_token_id'] == 0
     assert result.samples[0].tokens == [10, 11, 5, 6]
     # No EOS within max_new_tokens.
-    assert result.samples[0].status == Sample.Status.TRUNCATED
+    assert result.samples[0].status == RolloutRecord.Status.TRUNCATED
 
 
 def test_single_turn_records_log_probs_of_the_sampled_distribution():
@@ -1898,7 +1899,7 @@ def test_multi_turn_continuous_batching_generates_each_turn_as_if_alone(_tokeniz
     samples = rollout.generate(RolloutRequest(samples=[_prompt(prompt) for prompt in prompts]), sampling).samples
 
     assert len(samples) == 10
-    assert all(sample.status != Sample.Status.PENDING for sample in samples)
+    assert all(sample.status != RolloutRecord.Status.PENDING for sample in samples)
     if temperature <= 0:
         # Greedy first turns repeat the probe, so some trajectories call a tool and run more turns.
         assert sum(0 in sample.loss_mask for sample in samples) >= 2

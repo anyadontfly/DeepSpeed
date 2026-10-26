@@ -24,24 +24,28 @@ from deepspeed.runtime.rollout import (
     build_rollout,
     generalized_jsd_loss,
 )
-from deepspeed.runtime.rollout.base import Sample
+from deepspeed.runtime.rollout.base import RolloutRecord
 
 # --- dataclass invariants ---------------------------------------------------
 
 
 def test_rollout_request_validates_shapes():
-    RolloutRequest(samples=[Sample(prompt="not tokenized yet")])
+    RolloutRequest(samples=[RolloutRecord(prompt="not tokenized yet")])
     with pytest.raises(ValueError, match="does not match"):
-        RolloutRequest(samples=[Sample(tokens=[1, 2, 3], attention_mask=[1, 1])])
+        RolloutRequest(samples=[RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1])])
 
 
 def test_rollout_batch_validates_shapes():
     with pytest.raises(ValueError, match="does not match"):
-        RolloutBatch(samples=[Sample(tokens=[1, 2], attention_mask=[1, 1]), Sample(tokens=[1, 2], attention_mask=[1])])
+        RolloutBatch(samples=[
+            RolloutRecord(tokens=[1, 2], attention_mask=[1, 1]),
+            RolloutRecord(tokens=[1, 2], attention_mask=[1])
+        ])
 
 
 def test_rollout_batch_accessors():
-    batch = RolloutBatch(samples=[Sample(tokens=[1] * length, attention_mask=[1] * length) for length in (4, 12, 7)])
+    batch = RolloutBatch(
+        samples=[RolloutRecord(tokens=[1] * length, attention_mask=[1] * length) for length in (4, 12, 7)])
     assert batch.batch_size == 3
     assert batch.seq_len == 12
 
@@ -64,11 +68,12 @@ def test_continuous_batching_details_are_not_public_exports():
 def test_response_token_batch_masks_prompts_padding_and_tool_output():
     rollout = RolloutBatch(samples=[
         # Prompt [0, 11, 12] with its own left padding, response [21, 2].
-        Sample(tokens=[0, 11, 12, 21, 2], attention_mask=[0, 1, 1, 1, 1], response_length=2),
+        RolloutRecord(tokens=[0, 11, 12, 21, 2], attention_mask=[0, 1, 1, 1, 1], response_length=2),
         # Prompt [13, 14, 15], response [22, 23, 2].
-        Sample(tokens=[13, 14, 15, 22, 23, 2], attention_mask=[1] * 6, response_length=3),
+        RolloutRecord(tokens=[13, 14, 15, 22, 23, 2], attention_mask=[1] * 6, response_length=3),
         # Multi-turn: generated 31, tool output 41 (loss mask 0), generated 32 and EOS.
-        Sample(tokens=[16, 17, 31, 41, 32, 2], attention_mask=[1] * 6, response_length=4, loss_mask=[1, 0, 1, 1]),
+        RolloutRecord(
+            tokens=[16, 17, 31, 41, 32, 2], attention_mask=[1] * 6, response_length=4, loss_mask=[1, 0, 1, 1]),
     ])
 
     response_batch = ResponseTokenBatch.from_rollout(rollout, pad_token_id=0)
@@ -85,10 +90,10 @@ def test_response_token_batch_masks_prompts_padding_and_tool_output():
 @pytest.mark.parametrize(
     "sample",
     [
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=3),
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=4),
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=-1),
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=2, loss_mask=[1]),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=3),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=4),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=-1),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=2, loss_mask=[1]),
     ],
 )
 def test_response_token_batch_rejects_invalid_response_boundaries(sample):
@@ -97,7 +102,7 @@ def test_response_token_batch_rejects_invalid_response_boundaries(sample):
 
 
 def test_response_token_batch_aligns_causal_logits():
-    rollout = RolloutBatch(samples=[Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=1)])
+    rollout = RolloutBatch(samples=[RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1], response_length=1)])
     logits = torch.randn(1, 3, 5)
 
     response_batch = ResponseTokenBatch.from_rollout(rollout)
@@ -176,7 +181,7 @@ class FakeRollout(RolloutEngine):
                             attention_mask=prompt.attention_mask + [1] * len(response),
                             loss_mask=[1] * len(response),
                             response_length=len(response),
-                            status=Sample.Status.TRUNCATED))
+                            status=RolloutRecord.Status.TRUNCATED))
         return RolloutBatch(samples=samples)
 
     def sync_weights(self, step: int) -> None:
@@ -184,7 +189,7 @@ class FakeRollout(RolloutEngine):
 
 
 def _prompt(tokens, attention_mask=None):
-    return Sample(tokens=tokens, attention_mask=attention_mask or [1] * len(tokens))
+    return RolloutRecord(tokens=tokens, attention_mask=attention_mask or [1] * len(tokens))
 
 
 def test_fake_rollout_shape_basic():

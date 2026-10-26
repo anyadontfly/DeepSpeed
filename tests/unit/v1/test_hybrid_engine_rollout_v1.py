@@ -10,7 +10,7 @@ import torch
 from transformers import PretrainedConfig
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutRecord, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
 
 
@@ -49,8 +49,8 @@ def test_continuous_generation_profile_on_accelerator():
         cfg=HybridEngineRolloutConfig(enable_profiling=True),
     )
     request = RolloutRequest(samples=[
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
-        Sample(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
+        RolloutRecord(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
     ])
 
     output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1))
@@ -117,9 +117,9 @@ def test_continuous_graph_generation_refills_a_fixed_slot_on_cuda():
 
     def make_request():
         return RolloutRequest(samples=[
-            Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
-            Sample(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
-            Sample(tokens=[3, 3, 3], attention_mask=[1, 1, 1]),
+            RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
+            RolloutRecord(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
+            RolloutRecord(tokens=[3, 3, 3], attention_mask=[1, 1, 1]),
         ])
 
     sampling = SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2)
@@ -184,7 +184,7 @@ def test_continuous_graph_matches_pretrained_model_when_enabled():
 
             def make_request():
                 return RolloutRequest(
-                    samples=[Sample(tokens=encoded["input_ids"], attention_mask=encoded["attention_mask"])])
+                    samples=[RolloutRecord(tokens=encoded["input_ids"], attention_mask=encoded["attention_mask"])])
 
             eager_output = eager_rollout.generate(make_request(), sampling)
             graph_output = graph_rollout.generate(make_request(), sampling)
