@@ -10,6 +10,7 @@ only when CUDA is available.
 
 import gc
 import weakref
+from dataclasses import replace
 from types import SimpleNamespace
 from contextlib import nullcontext
 from unittest.mock import MagicMock, patch
@@ -1744,3 +1745,153 @@ def test_static_cache_falls_back_to_derived_head_dim():
     cache = DeepSpeedStaticCache(_cache_config(), batch_size=1, max_cache_len=8, device="cpu", dtype=torch.float32)
 
     assert tuple(cache.layers[0].keys.shape) == (1, 2, 8, 16)
+
+
+_ECHO_CALL = '<tool_call>{"name": "echo", "arguments": {}}</tool_call>'
+_TOOL_TOKENS = [9, 10]
+
+
+def _continuous_case(model_factory, dtype):
+    """A tiny model, prompts, an EOS id its greedy decoding produces, and the response length that calls a tool.
+
+    A greedy first turn is the probe's response cut at its first EOS, so responses of the shortest such length call
+    a tool: at least those prompts' trajectories run a second turn, whatever the random weights.
+    """
+    device = torch.device("cuda")
+    model = model_factory(device, dtype) if dtype is not None else model_factory(device)
+    torch.manual_seed(1)
+    prompts = [torch.randint(11, 60, (length, )).tolist() for length in (3, 7, 5, 9, 4)]
+    with torch.no_grad():
+        probe = [
+            model.generate(torch.tensor([prompt], device=device), max_new_tokens=8, do_sample=False,
+                           pad_token_id=0)[0, len(prompt):].tolist() for prompt in prompts
+        ]
+    # The most frequent greedy token ends turns often, so trajectories run several turns.
+    flat = [token for response in probe for token in response]
+    eos = max(set(flat), key=flat.count)
+    tool_length = min(response.index(eos) + 1 for response in probe if eos in response)
+    return model, prompts, eos, tool_length
+
+
+def _continuous_rollout(model, eos, tool_length, **cfg_kwargs):
+    # A response of tool_length tokens calls the echo tool, so turns end in tool calls and in answers. The pad id
+    # is outside the vocabulary: static batching drops generated tokens equal to it, continuous batching does not.
+    tokenizer = SimpleNamespace(pad_token_id=-1,
+                                eos_token_id=eos,
+                                decode=lambda ids, **_kwargs: _ECHO_CALL if len(ids) == tool_length else "")
+    cfg = HybridEngineRolloutConfig(multi_turn=True, max_turns=4, max_context_len=48, **cfg_kwargs)
+    engine = SimpleNamespace(module=model, zero_optimization_partition_weights=lambda: False)
+    return HybridEngineRollout(engine, tokenizer, cfg, tools=ToolSet([_EchoTool()]))
+
+
+def _check_as_if_alone(model, prompts, samples, n_samples_per_prompt, eos, tool_length, temperature, atol):
+    """Every generated token has the log-prob a plain forward over its trajectory alone gives it, greedy picks
+    the top token, and tool output follows exactly the turns that ended in a tool call."""
+    device = next(model.parameters()).device
+    for index, sample in enumerate(samples):
+        prompt = prompts[index // n_samples_per_prompt]
+        real = [token for token, keep in zip(sample.tokens, sample.attention_mask) if keep]
+        assert real[:len(prompt)] == prompt
+        turns = real[len(prompt):]
+        assert len(turns) == sample.response_length == len(sample.loss_mask) == len(sample.rollout_log_probs)
+        with torch.no_grad():
+            logits = model(torch.tensor([real], device=device)).logits[0].float()
+        position = 0
+        while position < len(turns):
+            end = position
+            while end < len(turns) and sample.loss_mask[end]:
+                end += 1
+            if end < len(turns):
+                # Environment text comes only after a turn that ended in EOS and called a tool.
+                response = turns[position:end]
+                assert response and response[-1] == eos and len(response) == tool_length
+                assert turns[end:end + len(_TOOL_TOKENS)] == _TOOL_TOKENS
+                assert sample.loss_mask[end:end + len(_TOOL_TOKENS)] == [0] * len(_TOOL_TOKENS)
+                end += len(_TOOL_TOKENS)
+            position = end
+        for position, (token, keep) in enumerate(zip(turns, sample.loss_mask)):
+            if not keep:
+                continue
+            step = logits[len(prompt) + position - 1]
+            scale = temperature if temperature > 0 else 1.0
+            expected = torch.log_softmax(step / scale, dim=-1)[token].item()
+            assert abs(sample.rollout_log_probs[position] - expected) < atol, f"sample {index} position {position}"
+            if temperature <= 0:
+                # Greedy, up to ties within numerical noise.
+                assert step[token] >= step.max() - atol
+
+
+@pytest.mark.parametrize("model_name, dtype, use_segki, use_graph_capture, temperature", [
+    ("qwen3_5", torch.float32, False, True, 0.0),
+    ("qwen3_5", torch.float32, False, False, 0.0),
+    ("qwen3_5", torch.bfloat16, True, True, 0.8),
+    ("llama", None, False, True, 0.0),
+])
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=_TOOL_TOKENS)
+def test_multi_turn_continuous_batching_generates_each_turn_as_if_alone(_tokenize_tool_responses, model_name, dtype,
+                                                                        use_segki, use_graph_capture, temperature):
+    """With fewer decode rows than trajectories, every turn waits for a row, is prefilled with its whole
+    conversation, and must decode exactly as the trajectory would alone."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("multi-turn continuous batching runs on CUDA")
+    model_factory = _tiny_qwen3_5 if model_name == "qwen3_5" else _tiny_llama
+    model, prompts, eos, tool_length = _continuous_case(model_factory, dtype)
+    rollout = _continuous_rollout(model, eos, tool_length, use_graph_capture=use_graph_capture, use_segki=use_segki)
+    sampling = SamplingConfig(max_new_tokens=24,
+                              max_new_tokens_per_turn=8,
+                              temperature=temperature,
+                              n_samples_per_prompt=2,
+                              continuous_batch_size=3,
+                              return_log_probs=True)
+
+    torch.manual_seed(2)
+    samples = rollout.generate(RolloutRequest(samples=[_prompt(prompt) for prompt in prompts]), sampling).samples
+
+    assert len(samples) == 10
+    assert all(sample.status != Sample.Status.PENDING for sample in samples)
+    if temperature <= 0:
+        # Greedy first turns repeat the probe, so some trajectories call a tool and run more turns.
+        assert sum(0 in sample.loss_mask for sample in samples) >= 2
+    # As in the phase C test: decoding (GDN recurrent step) and the full forward (chunked scan) differ by ~1e-4 in fp32.
+    atol = 1e-3 if dtype != torch.bfloat16 else 5e-2
+    _check_as_if_alone(model, prompts, samples, 2, eos, tool_length, temperature, atol)
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=_TOOL_TOKENS)
+def test_multi_turn_continuous_batching_matches_static_batching(_tokenize_tool_responses):
+    """At temperature 0 both schedules must produce the same trajectories, turn by turn."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("multi-turn continuous batching runs on CUDA")
+    model, prompts, eos, tool_length = _continuous_case(_tiny_qwen3_5, torch.float32)
+    request = RolloutRequest(samples=[_prompt(prompt) for prompt in prompts])
+    sampling = SamplingConfig(max_new_tokens=24,
+                              max_new_tokens_per_turn=8,
+                              temperature=0,
+                              n_samples_per_prompt=2,
+                              return_log_probs=True)
+
+    continuous_sampling = replace(sampling, continuous_batch_size=3)
+    static = _continuous_rollout(model, eos, tool_length, use_graph_capture=True).generate(request, sampling)
+    continuous_rollout = _continuous_rollout(model, eos, tool_length, use_graph_capture=True, enable_profiling=True)
+    continuous = continuous_rollout.generate(request, continuous_sampling)
+
+    assert sum(0 in sample.loss_mask for sample in continuous.samples) >= 2
+    # The poll trace accounts for every decoded token (each turn's first comes from its prefill), and never counts
+    # more decoding rows than rows holding a turn.
+    profile = continuous_rollout.get_last_profile()
+    trace = profile["continuous_poll_trace"]
+    assert trace[-1][4] == profile["num_generated_tokens"] - profile["num_turns"]
+    assert all(decoding <= held <= 3 for _, _, held, decoding, *_ in trace)
+    for expected, actual in zip(static.samples, continuous.samples):
+        assert actual.tokens == expected.tokens
+        assert actual.loss_mask == expected.loss_mask
+        assert actual.status == expected.status
+        torch.testing.assert_close(actual.rollout_log_probs, expected.rollout_log_probs, atol=1e-4, rtol=0)
+
+
+def test_multi_turn_continuous_batching_needs_a_row_capacity():
+    rollout = HybridEngineRollout(_make_engine(), _make_tokenizer(),
+                                  HybridEngineRolloutConfig(multi_turn=True, max_turns=2))
+    sampling = SamplingConfig(max_new_tokens=4, temperature=0, continuous_batch_size=2)
+    with pytest.raises(ValueError, match="max_context_len or continuous_cache_capacity"):
+        rollout.generate(RolloutRequest(samples=[_prompt([1, 2])]), sampling)

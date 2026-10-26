@@ -16,7 +16,10 @@ Two generation paths:
 """
 
 import asyncio
+import concurrent.futures
+import threading
 import time
+from collections import deque
 from copy import copy
 from dataclasses import dataclass, field, replace
 from inspect import signature
@@ -156,6 +159,9 @@ class HybridEngineRolloutConfig:
     enable_cache_trimming: bool = False
     multi_turn: bool = False
     continuous_cache_capacity: Optional[int] = None
+    # Multi-turn continuous batching: decode steps between host checks for finished turns. A turn that ends
+    # in between idles in its row until the check.
+    continuous_poll_steps: int = 16
     max_turns: Optional[int] = None
     # Most prompt + response tokens a multi-turn trajectory may hold; None means no cap.
     max_context_len: Optional[int] = None
@@ -207,6 +213,7 @@ class HybridEngineRollout(RolloutEngine):
         self.align_decode_fronts = getattr(cfg, 'align_decode_fronts', False) if cfg else False
         self.enable_cache_trimming = getattr(cfg, 'enable_cache_trimming', False) if cfg else False
         self.continuous_cache_capacity = getattr(cfg, 'continuous_cache_capacity', None) if cfg else None
+        self.continuous_poll_steps = getattr(cfg, 'continuous_poll_steps', 16) if cfg else 16
         self.multi_turn = getattr(cfg, 'multi_turn', False) if cfg else False
         self.max_turns = getattr(cfg, 'max_turns', None) if cfg else None
         self.max_context_len = getattr(cfg, 'max_context_len', None) if cfg else None
@@ -367,7 +374,7 @@ class HybridEngineRollout(RolloutEngine):
     @torch.no_grad()
     def _generate_multi_turn(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
         if sampling.continuous_batch_size is not None:
-            raise ValueError("Continuous batching is not supported")
+            return self._generate_multi_turn_continuous(request, sampling)
 
         samples = request.samples
         if not samples:
@@ -551,6 +558,357 @@ class HybridEngineRollout(RolloutEngine):
             self._last_profile = profile
 
         return RolloutBatch(samples=trajectories)
+
+    @torch.no_grad()
+    def _generate_multi_turn_continuous(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
+        """Multi-turn rollout with continuous batching over ``sampling.continuous_batch_size`` decode rows.
+
+        The scheduling unit is one turn of one trajectory. A turn waits for a free row, is prefilled into it
+        with the whole conversation so far (unpadded, as in ``_prefill_hybrid_rows``) and decodes there until
+        EOS or its budget. The row is released as soon as the turn ends. If the trajectory called tools, they
+        run on a background event loop while the row serves other turns, and the next turn joins the queue when
+        they return. Every row decodes at its own position in one step (a captured graph with
+        ``use_graph_capture``); rows without a turn decode throwaway tokens. Finished turns are collected every
+        ``continuous_poll_steps`` steps.
+
+        Turn budgets, statuses and the returned samples follow ``_generate_multi_turn``.
+        """
+        samples = request.samples
+        if not samples:
+            return RolloutBatch(samples=[])
+        self._check_sampling(sampling)
+        module = self.engine.module
+        num_rows = sampling.continuous_batch_size
+        capacity = self.continuous_cache_capacity or self.max_context_len
+        self._validate_multi_turn_continuous(module, num_rows, capacity)
+
+        from transformers import StaticCache
+        from deepspeed.utils.static_cache import DeepSpeedStaticCache, DSStaticGDNSlot
+
+        accelerator = get_accelerator()
+        call_start = time.perf_counter()
+        device = accelerator.current_device_name()
+        pad_token_id = self.tokenizer.pad_token_id
+        eos_token_id = self.tokenizer.eos_token_id
+        temperature = sampling.temperature
+        max_new_tokens = sampling.max_new_tokens
+        stats = {"prefill_ms": 0.0, "decode_ms": 0.0, "tool_ms": 0.0, "steps": 0, "polls": 0, "turns": 0}
+
+        samples = render_prompts(samples, self.tokenizer, self.tools.specs, pad_token_id, self.chat_template_kwargs)
+        trajectories = expand_samples(samples, sampling.n_samples_per_prompt)
+        generated = [0] * len(trajectories)
+        turns_done = [0] * len(trajectories)
+        # Trajectories whose next turn waits for a row; a turn that follows a tool call goes first.
+        pending = deque(range(len(trajectories)))
+        row_owner = [None] * num_rows
+        # Trajectory -> (response, log-probs, calls, future, submit time) while its tools run.
+        tools_in_flight = {}
+
+        def turn_budget(i):
+            context_len = sum(trajectories[i].attention_mask)
+            budget = max_new_tokens - generated[i]
+            if sampling.max_new_tokens_per_turn is not None:
+                budget = min(budget, sampling.max_new_tokens_per_turn)
+            if self.max_context_len is not None:
+                budget = min(budget, self.max_context_len - context_len)
+            return min(budget, capacity - context_len)
+
+        model_dtype = next(module.parameters()).dtype
+        is_hybrid = _has_linear_attention(module.config)
+        rows = torch.arange(num_rows, device=device)
+        slots = torch.arange(capacity, device=device)
+        ds_cache = DeepSpeedStaticCache(module.config,
+                                        batch_size=num_rows,
+                                        max_cache_len=capacity,
+                                        device=device,
+                                        dtype=model_dtype)
+        gdn_cache = None
+        if is_hybrid:
+            # Only the linear-attention layers of this cache are used, so its full-attention layers get one slot.
+            gdn_cache = self._create_static_cache(StaticCache, module.config, num_rows, 1, device, model_dtype)
+        write_pos = torch.zeros(num_rows, dtype=torch.long, device=device)
+        ds_cache.set_write_position(write_pos)
+        static_token = torch.zeros(num_rows, 1, dtype=torch.long, device=device)
+        static_attn = torch.zeros(num_rows, 1, 1, capacity, dtype=torch.bool, device=device)
+        # A row that never held a turn still attends one slot, so its throwaway logits stay finite.
+        static_attn[:, 0, 0, 0] = True
+        decode_mask = {"full_attention": static_attn, "linear_attention": None} if is_hybrid else static_attn
+        static_cache_pos = write_pos[:1]
+        static_pos_ids = write_pos.unsqueeze(1)
+        # Each row's turn on the device, so decode steps never wait for the host.
+        active = torch.zeros(num_rows, dtype=torch.bool, device=device)
+        num_generated = torch.zeros(num_rows, dtype=torch.long, device=device)
+        turn_limit = torch.zeros(num_rows, dtype=torch.long, device=device)
+        turn_len = max(1, min(capacity, max_new_tokens, sampling.max_new_tokens_per_turn or max_new_tokens))
+        token_buf = torch.zeros(num_rows, turn_len, dtype=torch.long, device=device)
+        log_prob_buf = torch.zeros(num_rows, turn_len, dtype=torch.float32, device=device)
+        stop_token = eos_token_id if eos_token_id is not None else -1
+        # With profiling, one entry per poll shows how the rows were used over the call (the drain at its end).
+        poll_trace = [] if self.enable_profiling else None
+        decoded = torch.zeros((), dtype=torch.long, device=device)
+        logits_kwargs = {"logits_to_keep": 1} if "logits_to_keep" in signature(module.forward).parameters else {}
+
+        def admit():
+            free_rows = [row for row, owner in enumerate(row_owner) if owner is None]
+            admitted = []
+            while free_rows and pending:
+                i = pending.popleft()
+                budget = turn_budget(i)
+                if budget <= 0:
+                    # No room left to generate: the trajectory ends without another turn.
+                    trajectories[i].status = Sample.Status.TRUNCATED
+                    continue
+                admitted.append((free_rows.pop(0), i, budget))
+            if not admitted:
+                return False
+            prefill_start = self._sync_time(accelerator)
+            target = torch.tensor([row for row, _, _ in admitted], device=device)
+            prompt_ids, prompt_attn = left_pad_samples([trajectories[i] for _, i, _ in admitted], pad_token_id)
+            lengths = prompt_attn.sum(dim=1).to(device)
+            logits = self._prefill_hybrid_rows(module,
+                                               prompt_ids.to(device),
+                                               lengths,
+                                               ds_cache,
+                                               logits_kwargs,
+                                               model_dtype,
+                                               device,
+                                               target_rows=target,
+                                               cache_rows=num_rows,
+                                               gdn_cache=gdn_cache)
+            first, first_log_probs = _select_next_tokens(logits, temperature)
+            limits = torch.tensor([budget for _, _, budget in admitted], device=device)
+            # The turn's context, and the slot its first decode input is written to.
+            static_attn[target, 0, 0, :] = slots.unsqueeze(0) <= lengths.unsqueeze(1)
+            write_pos[target] = lengths
+            static_token[target] = first
+            token_buf[target, 0] = first[:, 0]
+            log_prob_buf[target, 0] = first_log_probs[:, 0]
+            num_generated[target] = 1
+            turn_limit[target] = limits
+            active[target] = (first[:, 0] != stop_token) & (limits > 1)
+            for row, i, _ in admitted:
+                row_owner[row] = i
+            stats["turns"] += len(admitted)
+            stats["prefill_ms"] += (self._sync_time(accelerator) - prefill_start) * 1000.0
+            return True
+
+        def forward():
+            return module(static_token,
+                          attention_mask=decode_mask,
+                          past_key_values=ds_cache,
+                          use_cache=True,
+                          cache_position=static_cache_pos,
+                          position_ids=static_pos_ids)
+
+        def capture():
+            # Warmup and capture forwards advance the GDN states of rows holding turns; they are restored
+            # after each. Their KV writes land in the slots the first real step overwrites.
+            gdn_states = [(layer.conv_states[0], layer.recurrent_states[0]) for layer in ds_cache.layers
+                          if isinstance(layer, DSStaticGDNSlot)]
+            snapshot = [(conv.clone(), recurrent.clone()) for conv, recurrent in gdn_states]
+
+            def restore_gdn_states():
+                for (conv, recurrent), (conv0, recurrent0) in zip(gdn_states, snapshot):
+                    conv.copy_(conv0)
+                    recurrent.copy_(recurrent0)
+
+            # Forward hooks synchronize, which is illegal during graph capture.
+            saved_pre = dict(module._forward_pre_hooks)
+            saved_post = dict(module._forward_hooks)
+            module._forward_pre_hooks.clear()
+            module._forward_hooks.clear()
+            try:
+                stream = accelerator.Stream()
+                stream.wait_stream(accelerator.current_stream())
+                with accelerator.stream(stream):
+                    for _ in range(3):
+                        forward()
+                accelerator.current_stream().wait_stream(stream)
+                restore_gdn_states()
+                graph = accelerator.create_graph()
+                with accelerator.capture_to_graph(graph):
+                    logits = forward().logits
+                restore_gdn_states()
+            finally:
+                module._forward_pre_hooks.update(saved_pre)
+                module._forward_hooks.update(saved_post)
+            return graph, logits
+
+        graph = None
+        static_logits = None
+
+        def decode_step():
+            if graph is not None:
+                accelerator.replay_graph(graph)
+                logits = static_logits[:, -1, :]
+            else:
+                logits = forward().logits[:, -1, :]
+            tokens, log_probs = _select_next_tokens(logits, temperature)
+            # Record each decoding row's token at its next position; other rows keep their buffers.
+            position = num_generated.clamp(max=turn_len - 1).unsqueeze(1)
+            recording = active.unsqueeze(1)
+            token_buf.scatter_(1, position, torch.where(recording, tokens, token_buf.gather(1, position)))
+            log_prob_buf.scatter_(1, position, torch.where(recording, log_probs, log_prob_buf.gather(1, position)))
+            num_generated.add_(active.long())
+            if poll_trace is not None:
+                decoded.add_(active.sum())
+            ended = (tokens[:, 0] == stop_token) | (num_generated >= turn_limit)
+            active.logical_and_(~ended)
+            # The sampled token is each row's next input, written to the following slot.
+            static_token.copy_(tokens)
+            write_pos.add_(active.long())
+            static_attn[rows, 0, 0, write_pos] |= active
+
+        def finish_turn(i, response, response_log_probs):
+            sample = trajectories[i]
+            turn = turns_done[i]
+            turns_done[i] += 1
+            generated[i] += len(response)
+            log_probs = response_log_probs if sampling.return_log_probs else None
+            # A turn that did not reach EOS was cut by the token or context budget.
+            if not response or response[-1] != eos_token_id:
+                sample.status = Sample.Status.TRUNCATED
+                update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
+                return
+            # Keep special tokens when decoding: tool-call tags can be special tokens.
+            calls = self.parse_tool_calls(self.tokenizer.decode(response), self.tools)
+            if not calls:
+                sample.status = Sample.Status.COMPLETED
+                update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
+                return
+            # It asked for a tool but has no budget or turn left to read the result.
+            if generated[i] >= max_new_tokens or turn == self.max_turns - 1:
+                sample.status = Sample.Status.TRUNCATED
+                update_sample_from_response(sample, response, log_probs, [], self.tokenizer)
+                return
+            future = asyncio.run_coroutine_threadsafe(self._run_tool_calls({i: calls}), tool_loop)
+            tools_in_flight[i] = (response, log_probs, calls, future, time.perf_counter())
+
+        def collect_finished_turns(still_active):
+            finished = [row for row, owner in enumerate(row_owner) if owner is not None and not still_active[row]]
+            if not finished:
+                return
+            finished_rows = torch.tensor(finished, device=device)
+            counts = num_generated[finished_rows].tolist()
+            width = max(counts)
+            tokens = token_buf[finished_rows, :width].tolist()
+            log_probs = log_prob_buf[finished_rows, :width].tolist()
+            for row, count, row_tokens, row_log_probs in zip(finished, counts, tokens, log_probs):
+                i = row_owner[row]
+                row_owner[row] = None
+                finish_turn(i, row_tokens[:count], row_log_probs[:count])
+
+        def collect_tool_results():
+            for i in [i for i, entry in tools_in_flight.items() if entry[3].done()]:
+                response, log_probs, calls, future, submitted = tools_in_flight.pop(i)
+                stats["tool_ms"] += (time.perf_counter() - submitted) * 1000.0
+                outputs = future.result()[i]
+                tool_messages = [{
+                    "role": "tool",
+                    "name": call.name or "unknown",
+                    "content": output
+                } for call, output in zip(calls, outputs)]
+                tool_response = tokenize_tool_responses(tool_messages, self.tokenizer, self.chat_template_kwargs)
+                update_sample_from_response(trajectories[i], response, log_probs, tool_response, self.tokenizer)
+                pending.appendleft(i)
+
+        tool_loop = asyncio.new_event_loop()
+        tool_thread = threading.Thread(target=tool_loop.run_forever, name="rollout-tools", daemon=True)
+        tool_thread.start()
+        self._install_segki_decode(module, write_pos, capacity, model_dtype, device)
+        try:
+            while any(owner is not None for owner in row_owner) or pending or tools_in_flight:
+                if admit() and self.use_graph_capture and graph is None:
+                    graph, static_logits = capture()
+                rows_held = sum(owner is not None for owner in row_owner)
+                if rows_held:
+                    decode_start = time.perf_counter()
+                    for _ in range(self.continuous_poll_steps):
+                        decode_step()
+                    still_active = active.tolist()
+                    stats["decode_ms"] += (time.perf_counter() - decode_start) * 1000.0
+                    stats["steps"] += self.continuous_poll_steps
+                    stats["polls"] += 1
+                    collect_finished_turns(still_active)
+                    if poll_trace is not None:
+                        poll_trace.append((stats["steps"], round(time.perf_counter() - call_start, 3), rows_held,
+                                           sum(still_active), decoded.item(), len(pending), len(tools_in_flight)))
+                elif tools_in_flight and not pending:
+                    # Nothing to decode or admit until a tool returns.
+                    concurrent.futures.wait([entry[3] for entry in tools_in_flight.values()],
+                                            return_when=concurrent.futures.FIRST_COMPLETED)
+                collect_tool_results()
+        finally:
+            tool_loop.call_soon_threadsafe(tool_loop.stop)
+            tool_thread.join()
+            tool_loop.close()
+
+        if self.enable_profiling:
+            total_ms = (self._sync_time(accelerator) - call_start) * 1000.0
+            num_generated_tokens = sum(generated)
+            self._last_profile = {
+                "generation_ms":
+                stats["prefill_ms"] + stats["decode_ms"],
+                "prefill_forward_ms":
+                stats["prefill_ms"],
+                "decode_forward_ms":
+                stats["decode_ms"],
+                "num_decode_forwards":
+                stats["steps"],
+                "tool_ms":
+                stats["tool_ms"],
+                "num_generated_tokens":
+                num_generated_tokens,
+                "num_turns":
+                stats["turns"],
+                "total_ms":
+                total_ms,
+                "tokens_per_second":
+                num_generated_tokens / (total_ms / 1000.0) if total_ms > 0.0 else 0.0,
+                "batch_size":
+                len(trajectories),
+                "num_samples_per_prompt":
+                sampling.n_samples_per_prompt,
+                "continuous_rows":
+                num_rows,
+                "continuous_polls":
+                stats["polls"],
+                # Decode slots used: tokens after each turn's first (which comes from its prefill) per row-step.
+                "continuous_decode_occupancy":
+                ((num_generated_tokens - stats["turns"]) / (stats["steps"] * num_rows) if stats["steps"] else 0.0),
+                # Per poll: (decode steps so far, seconds since the call started, rows holding a turn during the
+                # poll's steps, rows still decoding after them, tokens decoded so far, turns queued, trajectories
+                # waiting on tools).
+                "continuous_poll_trace":
+                poll_trace,
+            }
+        return RolloutBatch(samples=trajectories)
+
+    @staticmethod
+    def _sync_time(accelerator):
+        accelerator.synchronize()
+        return time.perf_counter()
+
+    def _validate_multi_turn_continuous(self, module, num_rows, capacity):
+        if num_rows <= 0:
+            raise ValueError("continuous_batch_size must be positive")
+        if capacity is None:
+            raise ValueError("multi-turn continuous batching sizes its rows by max_context_len or "
+                             "continuous_cache_capacity; set one of them")
+        max_positions = getattr(module.config, "max_position_embeddings", None)
+        if max_positions is not None and capacity > max_positions:
+            raise ValueError("continuous batching cache exceeds the model maximum position embeddings")
+        if self.use_shared_prefill:
+            raise ValueError("continuous batching does not support shared prompt prefill")
+        partitions_weights = getattr(self.engine, "zero_optimization_partition_weights", None)
+        if partitions_weights is not None and partitions_weights():
+            # ZeRO-3 gathers parameters inside each forward, which neither a captured graph nor rows that
+            # finish at different steps allow.
+            raise ValueError("multi-turn continuous batching does not support ZeRO-3")
+        if getattr(module, "_supports_cache_class", None) is False:
+            raise ValueError("continuous batching requires a model with cache-class support")
+        if getattr(module.config, "_attn_implementation", None) == "flash_attention_2":
+            raise ValueError("multi-turn continuous batching does not support flash_attention_2")
 
     def _check_sampling(self, sampling: SamplingConfig) -> None:
         if sampling.max_new_tokens_per_turn is not None and sampling.max_new_tokens_per_turn <= 0:
@@ -1624,33 +1982,52 @@ class HybridEngineRollout(RolloutEngine):
     # Graph capture decode loop
     # ------------------------------------------------------------------
 
-    def _prefill_hybrid_rows(self, module, prompt_ids, row_lengths, ds_cache, logits_kwargs, model_dtype, device):
+    def _prefill_hybrid_rows(self,
+                             module,
+                             prompt_ids,
+                             row_lengths,
+                             ds_cache,
+                             logits_kwargs,
+                             model_dtype,
+                             device,
+                             target_rows=None,
+                             cache_rows=None,
+                             gdn_cache=None):
         """Prefill a hybrid model's left-padded prompts without their padding; returns the last-position logits.
 
         GDN layers fold every input token into their recurrent state and have no way to skip pad tokens, so each
         group of equally long rows is prefilled on its own, unpadded, into a prompt-sized HF cache. The groups'
         full-attention KV lands in slots ``0..len-1`` of ``ds_cache``, and their GDN states in one batched
         linear-attention cache that the GDN slots of ``ds_cache`` adopt.
+
+        By default prompt ``i`` fills row ``i`` of a new linear-attention cache. Continuous batching passes
+        ``target_rows`` (prompt ``i`` fills row ``target_rows[i]``), the ``cache_rows`` of its caches and its own
+        ``gdn_cache``, so newly admitted requests fill free rows of caches that outlive the call. Models
+        without linear-attention layers take the same path, with no GDN state to copy.
         """
         from transformers import StaticCache
         from deepspeed.utils.static_cache import DSStaticGDNSlot
 
         batch_size, prompt_len = prompt_ids.shape
-        # Only the linear-attention layers of this cache are used, so its full-attention layers get one slot.
-        gdn_cache = self._create_static_cache(StaticCache, module.config, batch_size, 1, device, model_dtype)
+        is_hybrid = _has_linear_attention(module.config)
+        if target_rows is None:
+            target_rows = torch.arange(batch_size, device=device)
+        if gdn_cache is None and is_hybrid:
+            # Only the linear-attention layers of this cache are used, so its full-attention layers get one slot.
+            gdn_cache = self._create_static_cache(StaticCache, module.config, batch_size, 1, device, model_dtype)
+        cache_rows = cache_rows or batch_size
+        # GDN layers must see None (a 2-D mask corrupts their conv-state init); these rows have no padding.
+        prefill_mask = {"full_attention": None, "linear_attention": None} if is_hybrid else None
         last_logits = None
         lengths = row_lengths.tolist()
         for length in sorted(set(lengths)):
             group = torch.tensor([row for row, n in enumerate(lengths) if n == length], device=device)
+            targets = target_rows[group]
             group_cache = self._create_static_cache(StaticCache, module.config, group.numel(), length, device,
                                                     model_dtype)
             prefill_out = module(
                 prompt_ids[group, prompt_len - length:],
-                # GDN layers must see None (a 2-D mask corrupts their conv-state init); these rows have no padding.
-                attention_mask={
-                    "full_attention": None,
-                    "linear_attention": None
-                },
+                attention_mask=prefill_mask,
                 past_key_values=group_cache,
                 use_cache=True,
                 cache_position=torch.arange(length, device=device),
@@ -1662,14 +2039,15 @@ class HybridEngineRollout(RolloutEngine):
 
             for layer_idx, ds_layer in enumerate(ds_cache.layers):
                 if isinstance(ds_layer, DSStaticGDNSlot):
-                    self._copy_gdn_rows(group_cache.layers[layer_idx], gdn_cache.layers[layer_idx], group, batch_size)
+                    self._copy_gdn_rows(group_cache.layers[layer_idx], gdn_cache.layers[layer_idx], targets,
+                                        cache_rows)
                     continue
                 hf_keys, hf_values = self._cache_layer_tensors(group_cache, layer_idx)
                 if not ds_layer.is_initialized:
-                    ds_layer.lazy_initialization(hf_keys.new_empty(batch_size, *hf_keys.shape[1:]),
-                                                 hf_values.new_empty(batch_size, *hf_values.shape[1:]))
-                ds_layer.keys[group, :, :length, :] = hf_keys
-                ds_layer.values[group, :, :length, :] = hf_values
+                    ds_layer.lazy_initialization(hf_keys.new_empty(cache_rows, *hf_keys.shape[1:]),
+                                                 hf_values.new_empty(cache_rows, *hf_values.shape[1:]))
+                ds_layer.keys[targets, :, :length, :] = hf_keys
+                ds_layer.values[targets, :, :length, :] = hf_values
             # Its rows are copied out; dropping the group's cache frees its KV before the next group runs.
             del prefill_out, group_cache
 
@@ -1693,6 +2071,35 @@ class HybridEngineRollout(RolloutEngine):
                 batch_slot.lazy_initialization(
                     recurrent_states=recurrent_states.new_zeros(batch_size, *recurrent_states.shape[1:]))
             batch_slot.recurrent_states[0][group] = group_slot.recurrent_states[0]
+
+    def _install_segki_decode(self, module, write_pos, max_len, model_dtype, device):
+        """Install segment-KI's decode kernels on ``module`` for a cache of ``max_len`` slots read at ``write_pos``.
+
+        ``decode_attn`` replaces SDPA in the full-attention layers and ``fused_add_norm`` the post-attention add +
+        norm. Both only act on single-token decode steps, so prefill and non-graph paths keep the original forward.
+        """
+        module._ki_fused_norm_patched = 0
+        if not self.use_segki:
+            return
+        try:
+            from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm
+            from deepspeed.ops.module_inject import get_fused_glu_op
+            attn_op = get_fused_glu_op()
+            # Full-length RoPE tables for the fused q-side path; positions are indexed on the device at replay
+            # time, so the addresses stay fixed for the captured graph.
+            cos_t = sin_t = None
+            rotary = getattr(getattr(module, "model", module), "rotary_emb", None)
+            if rotary is not None:
+                with torch.no_grad():
+                    positions = torch.arange(max_len, device=device)[None, :]
+                    cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
+                    cos_t = cos_t[0].float().contiguous()
+                    sin_t = sin_t[0].float().contiguous()
+            if hasattr(attn_op, "decode_attn"):
+                install_decode_attention(module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t)
+            module._ki_fused_norm_patched = install_fused_norm(module, attn_op)
+        except Exception:
+            module._ki_fused_norm_patched = 0
 
     def _generate_graph(self,
                         prompt_ids,
@@ -1792,30 +2199,9 @@ class HybridEngineRollout(RolloutEngine):
         full_token_buf[:, prompt_len] = next_token.view(-1)
 
         # Replace SDPA in the full-attention layers with segment-KI's decode_attn kernel, and the post-attention
-        # add + norm with fused_add_norm. Both only act on single-token decode steps, so prefill and non-graph
-        # paths keep the original forward. Installed before the warmup so the captured graph records the kernels,
+        # add + norm with fused_add_norm. Installed before the warmup so the captured graph records the kernels,
         # and on every call so the RoPE tables and norm scales follow the current weights.
-        module._ki_fused_norm_patched = 0
-        if self.use_segki:
-            try:
-                from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm
-                from deepspeed.ops.module_inject import get_fused_glu_op
-                attn_op = get_fused_glu_op()
-                # Full-length RoPE tables for the fused q-side path; positions are indexed on the device at replay
-                # time, so the addresses stay fixed for the captured graph.
-                cos_t = sin_t = None
-                rotary = getattr(getattr(module, "model", module), "rotary_emb", None)
-                if rotary is not None:
-                    with torch.no_grad():
-                        positions = torch.arange(max_len, device=device)[None, :]
-                        cos_t, sin_t = rotary(torch.zeros(1, max_len, dtype=model_dtype, device=device), positions)
-                        cos_t = cos_t[0].float().contiguous()
-                        sin_t = sin_t[0].float().contiguous()
-                if hasattr(attn_op, "decode_attn"):
-                    install_decode_attention(module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t)
-                module._ki_fused_norm_patched = install_fused_norm(module, attn_op)
-            except Exception:
-                module._ki_fused_norm_patched = 0
+        self._install_segki_decode(module, write_pos, max_len, model_dtype, device)
 
         # Snapshot the GDN states right after prefill: the warmup and capture forwards advance the conv and
         # recurrent states, so they are restored afterwards or every replay starts from corrupted state.
