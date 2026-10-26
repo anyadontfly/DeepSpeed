@@ -646,7 +646,7 @@ class HybridEngineRollout(RolloutEngine):
         # With profiling, one entry per poll shows how the rows were used over the call (the drain at its end).
         poll_trace = [] if self.enable_profiling else None
         decoded = torch.zeros((), dtype=torch.long, device=device)
-        logits_kwargs = {"logits_to_keep": 1} if "logits_to_keep" in signature(module.forward).parameters else {}
+        logits_kwargs = self._last_logits_kwargs(module)
 
         def admit():
             free_rows = [row for row, owner in enumerate(row_owner) if owner is None]
@@ -2151,8 +2151,7 @@ class HybridEngineRollout(RolloutEngine):
             device=device,
             dtype=model_dtype,
         )
-        # Only the last position picks the first token; full prefill logits are [batch, prompt_len, vocab].
-        logits_kwargs = {"logits_to_keep": 1} if "logits_to_keep" in signature(module.forward).parameters else {}
+        logits_kwargs = self._last_logits_kwargs(module)
         if is_hybrid:
             row_lengths = prompt_attn.sum(dim=1)
             prefill_logits = self._prefill_hybrid_rows(module, prompt_ids, row_lengths, ds_cache, logits_kwargs,
