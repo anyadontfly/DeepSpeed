@@ -10,7 +10,7 @@ import torch
 from transformers import PretrainedConfig
 
 from deepspeed.accelerator import get_accelerator
-from deepspeed.runtime.rollout.base import RolloutRequest, Sample, SamplingConfig
+from deepspeed.runtime.rollout.base import RolloutRecord, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
 
 
@@ -49,8 +49,8 @@ def test_continuous_generation_profile_on_accelerator():
         cfg=HybridEngineRolloutConfig(enable_profiling=True),
     )
     request = RolloutRequest(samples=[
-        Sample(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
-        Sample(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
+        RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
+        RolloutRecord(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
     ])
 
     output = rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1))
@@ -107,27 +107,30 @@ def test_continuous_graph_generation_refills_a_fixed_slot_on_cuda():
             return SimpleNamespace(logits=logits, past_key_values=past_key_values)
 
     device = torch.device(accelerator.device_name())
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=2, decode=lambda ids, **_kwargs: "")
     graph_rollout = HybridEngineRollout(
         SimpleNamespace(module=CacheClassModel().to(device)),
-        SimpleNamespace(pad_token_id=0, eos_token_id=2),
+        tokenizer,
         cfg=HybridEngineRolloutConfig(use_graph_capture=True),
     )
-    eager_rollout = HybridEngineRollout(
-        SimpleNamespace(module=CacheClassModel().to(device)),
-        SimpleNamespace(pad_token_id=0, eos_token_id=2),
-    )
-    request = RolloutRequest(
-        torch.tensor([[1, 2, 3], [1, 2, 4], [3, 3, 3]], device=device),
-        torch.ones((3, 3), dtype=torch.long, device=device),
-    )
+    eager_rollout = HybridEngineRollout(SimpleNamespace(module=CacheClassModel().to(device)), tokenizer)
+
+    def make_request():
+        return RolloutRequest(samples=[
+            RolloutRecord(tokens=[1, 2, 3], attention_mask=[1, 1, 1]),
+            RolloutRecord(tokens=[1, 2, 4], attention_mask=[1, 1, 1]),
+            RolloutRecord(tokens=[3, 3, 3], attention_mask=[1, 1, 1]),
+        ])
 
     sampling = SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=2)
-    eager_output = eager_rollout.generate(request, sampling)
-    graph_output = graph_rollout.generate(request, sampling)
+    eager_output = eager_rollout.generate(make_request(), sampling)
+    graph_output = graph_rollout.generate(make_request(), sampling)
 
-    assert torch.equal(graph_output.input_ids, eager_output.input_ids)
-    assert torch.equal(graph_output.attention_mask, eager_output.attention_mask)
-    assert graph_output.input_ids[:, 3:].cpu().tolist() == [[2, 0], [7, 2], [7, 2]]
+    assert [sample.tokens for sample in graph_output.samples] == [sample.tokens for sample in eager_output.samples]
+    assert [sample.attention_mask
+            for sample in graph_output.samples] == [sample.attention_mask for sample in eager_output.samples]
+    # A response stops at its EOS (token 2).
+    assert [sample.tokens[3:] for sample in graph_output.samples] == [[2], [7, 2], [7, 2]]
     stats = graph_rollout.get_last_continuous_stats()
     assert stats["cache_capacity"] == 5
     assert stats["peak_cache_length"] == 4
@@ -177,13 +180,17 @@ def test_continuous_graph_matches_pretrained_model_when_enabled():
         )
         for seed, prompt in zip((1234, 1235), prompts):
             torch.manual_seed(seed)
-            encoded = tokenizer(prompt, return_tensors="pt", padding="max_length", max_length=32, truncation=True)
-            request = RolloutRequest(encoded.input_ids.to(device), encoded.attention_mask.to(device))
-            eager_output = eager_rollout.generate(request, sampling)
-            graph_output = graph_rollout.generate(request, sampling)
+            encoded = tokenizer(prompt, padding="max_length", max_length=32, truncation=True)
 
-            assert torch.equal(graph_output.input_ids, eager_output.input_ids)
-            assert torch.equal(graph_output.attention_mask, eager_output.attention_mask)
+            def make_request():
+                return RolloutRequest(
+                    samples=[RolloutRecord(tokens=encoded["input_ids"], attention_mask=encoded["attention_mask"])])
+
+            eager_output = eager_rollout.generate(make_request(), sampling)
+            graph_output = graph_rollout.generate(make_request(), sampling)
+
+            assert graph_output.samples[0].tokens == eager_output.samples[0].tokens
+            assert graph_output.samples[0].attention_mask == eager_output.samples[0].attention_mask
     finally:
         accelerator.create_graph = original_create_graph
 
@@ -211,7 +218,7 @@ def _tiny_llama(device):
 
 def _rollout(model, use_graph_capture):
     # eos -1 never matches, so every row generates the full length.
-    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=-1)
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=-1, decode=lambda ids, **_kwargs: "")
     return HybridEngineRollout(SimpleNamespace(module=model),
                                tokenizer,
                                cfg=HybridEngineRolloutConfig(use_graph_capture=use_graph_capture))
@@ -220,7 +227,8 @@ def _rollout(model, use_graph_capture):
 def _random_request(batch_size, prompt_len, device):
     generator = torch.Generator().manual_seed(1)
     prompt_ids = torch.randint(1, 64, (batch_size, prompt_len), generator=generator)
-    return RolloutRequest(prompt_ids.to(device), torch.ones_like(prompt_ids).to(device))
+    return prompt_ids.to(device), RolloutRequest(
+        samples=[RolloutRecord(tokens=row.tolist(), attention_mask=[1] * prompt_len) for row in prompt_ids])
 
 
 @pytest.mark.parametrize("use_graph_capture, continuous_batch_size", [(True, None), (True, 8), (False, 8)])
@@ -235,7 +243,7 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
     new_tokens = 32
     # Every prompt gets its own continuous batching slot, so each step draws the tokens of all rows in one call, as
     # generate() does, and the same seed gives both the same random numbers.
-    request = _random_request(batch_size=8, prompt_len=8, device=device)
+    prompt_ids, request = _random_request(batch_size=8, prompt_len=8, device=device)
     sampling = SamplingConfig(max_new_tokens=new_tokens,
                               temperature=temperature,
                               top_k=top_k,
@@ -247,8 +255,8 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
 
     torch.manual_seed(2)
     with torch.no_grad():
-        expected = model.generate(request.prompt_ids,
-                                  attention_mask=request.prompt_attention_mask,
+        expected = model.generate(prompt_ids,
+                                  attention_mask=torch.ones_like(prompt_ids),
                                   max_new_tokens=new_tokens,
                                   do_sample=True,
                                   temperature=temperature,
@@ -257,4 +265,4 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
                                   eos_token_id=None,
                                   pad_token_id=0)
 
-    assert output.input_ids.tolist() == expected.tolist()
+    assert [sample.tokens for sample in output.samples] == expected.tolist()

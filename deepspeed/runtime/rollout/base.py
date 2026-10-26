@@ -63,8 +63,8 @@ class SamplingConfig:
 
 
 @dataclass
-class Sample:
-    """One generated sample."""
+class RolloutRecord:
+    """One prompt and its rollout: tokens across all turns, masks, log-probs, reward and status."""
 
     class Status(Enum):
         PENDING = "pending"
@@ -92,7 +92,7 @@ class Sample:
 class RolloutRequest:
     """Input to ``RolloutEngine.generate``."""
 
-    samples: list[Sample]
+    samples: list[RolloutRecord]
 
     def __post_init__(self) -> None:
         for i, sample in enumerate(self.samples):
@@ -105,7 +105,7 @@ class RolloutRequest:
 class RolloutBatch:
     """Output of ``RolloutEngine.generate``."""
 
-    samples: list[Sample]
+    samples: list[RolloutRecord]
 
     def __post_init__(self) -> None:
         for i, sample in enumerate(self.samples):
