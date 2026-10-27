@@ -2085,14 +2085,15 @@ class HybridEngineRollout(RolloutEngine):
     def _install_segki_decode(self, module, write_pos, max_len, model_dtype, device):
         """Install segment-KI's decode kernels on ``module`` for a cache of ``max_len`` slots read at ``write_pos``.
 
-        ``decode_attn`` replaces SDPA in the full-attention layers and ``fused_add_norm`` the post-attention add +
-        norm. Both only act on single-token decode steps, so prefill and non-graph paths keep the original forward.
+        ``decode_attn`` replaces SDPA in the full-attention layers, ``fused_add_norm`` the post-attention add + norm,
+        and the grouped kernel serves ``lm_head`` at 16-32 rows. All only act on single-token decode steps, so prefill
+        and non-graph paths keep the original forward.
         """
         module._ki_fused_norm_patched = 0
         if not self.use_segki:
             return
         try:
-            from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm
+            from deepspeed.module_inject.segment_ki import install_decode_attention, install_fused_norm, install_lm_head
             from deepspeed.ops.module_inject import get_fused_glu_op
             attn_op = get_fused_glu_op()
             # Full-length RoPE tables for the fused q-side path; positions are indexed on the device at replay
@@ -2108,6 +2109,7 @@ class HybridEngineRollout(RolloutEngine):
             if hasattr(attn_op, "decode_attn"):
                 install_decode_attention(module, write_pos, attn_op, cos_table=cos_t, sin_table=sin_t)
             module._ki_fused_norm_patched = install_fused_norm(module, attn_op)
+            install_lm_head(module, attn_op)
         except Exception:
             module._ki_fused_norm_patched = 0
 
@@ -2141,11 +2143,22 @@ class HybridEngineRollout(RolloutEngine):
         max_len = prompt_len + max_new_tokens
         eos_token_id = self.tokenizer.eos_token_id
         model_dtype = next(module.parameters()).dtype
+        # AutoTP wraps module.config as a dict after sharding; restore the
+        # original config object so cache creation and mask logic work
+        if isinstance(getattr(module, "config", None), dict):
+            from types import SimpleNamespace
+            module.config = SimpleNamespace(**module.config)
         is_hybrid = _has_linear_attention(module.config)
         rows = torch.arange(batch_size, device=device)
 
+        ds_tp_config = module.config
+        import deepspeed.comm as dist
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            ds_tp_config = copy(module.config)
+            ds_tp_config.num_key_value_heads = max(1, module.config.num_key_value_heads // dist.get_world_size())
+            ds_tp_config.num_attention_heads = max(1, module.config.num_attention_heads // dist.get_world_size())
         ds_cache = DeepSpeedStaticCache(
-            module.config,
+            ds_tp_config,
             batch_size=batch_size,
             max_cache_len=max_len,
             device=device,

@@ -95,7 +95,7 @@ class TestKernelReferenceConsistency:
         q_raw = torch.randn(b, nq, hd, dtype=torch.float32, device=DEV).bfloat16()
         K = torch.randn(b, nkv, maxlen, hd, dtype=torch.float32, device=DEV).bfloat16()
         V = torch.randn(b, nkv, maxlen, hd, dtype=torch.float32, device=DEV).bfloat16()
-        gate = torch.randn(b, nq * hd, dtype=torch.float32, device=DEV).bfloat16()
+        gate = torch.randn(b, nq, hd, dtype=torch.float32, device=DEV).bfloat16()
         nw = torch.randn(hd, dtype=torch.float32, device=DEV)
         pos = torch.tensor([5, 11, 0, 39], dtype=torch.long, device=DEV)
         cos_t = torch.randn(maxlen, hd, dtype=torch.float32, device=DEV)
@@ -115,6 +115,9 @@ class TestKernelReferenceConsistency:
                           cos_t=cos_t,
                           sin_t=sin_t,
                           gate=gate,
+                          k_raw=torch.empty(0, device=DEV),
+                          v_raw=torch.empty(0, device=DEV),
+                          k_norm_w=torch.empty(0, device=DEV),
                           eps=1e-6,
                           rope_dim=hd)
 
@@ -138,7 +141,7 @@ class TestKernelReferenceConsistency:
         q_raw = torch.randn(b, nq, hd, dtype=torch.float32, device=DEV).bfloat16()
         K = torch.randn(b, nkv, maxlen, hd, dtype=torch.float32, device=DEV).bfloat16()
         V = torch.randn(b, nkv, maxlen, hd, dtype=torch.float32, device=DEV).bfloat16()
-        gate = torch.randn(b, nq * hd, dtype=torch.float32, device=DEV).bfloat16()
+        gate = torch.randn(b, nq, hd, dtype=torch.float32, device=DEV).bfloat16()
         nw = torch.randn(hd, dtype=torch.float32, device=DEV)
         pos = torch.tensor([7, 21], dtype=torch.long, device=DEV)
         cos_t = torch.randn(maxlen, rope_dim, dtype=torch.float32, device=DEV)
@@ -157,6 +160,9 @@ class TestKernelReferenceConsistency:
                           cos_t=cos_t,
                           sin_t=sin_t,
                           gate=gate,
+                          k_raw=torch.empty(0, device=DEV),
+                          v_raw=torch.empty(0, device=DEV),
+                          k_norm_w=torch.empty(0, device=DEV),
                           eps=1e-6,
                           rope_dim=rope_dim)
         qf = q_raw.float()
@@ -289,18 +295,19 @@ class TestKernelReferenceConsistency:
             expected = ref_decode_attn(q.float(), K.float(), V.float(), ref_pos)
             torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
 
-    def test_decode_attn_rejects_strided_q(self):
-        """The kernel indexes q as packed [b, heads, head_dim]: a strided view,
-        such as the query half of a fused query|gate projection, must raise
-        rather than be read as the wrong heads."""
+    def test_decode_attn_strided_q_matches_packed(self):
+        """A strided q, such as the query half of a fused query|gate projection,
+        is read through its head stride: the output matches a packed copy."""
         nq, nkv, hd, maxlen = 4, 2, 64, 8
-        q = _rand_bf16(1, nq, 2 * hd)[..., :hd]
-        K = _rand_bf16(1, nkv, maxlen, hd)
-        V = _rand_bf16(1, nkv, maxlen, hd)
-        out = torch.empty(1, nq, hd, dtype=torch.bfloat16, device=DEV)
-        pos = torch.tensor([3], dtype=torch.long, device=DEV)
-        with pytest.raises(RuntimeError, match="q must be contiguous"):
-            _op().decode_attn(q, K, V, pos, out, nq, nkv, hd, maxlen)
+        q = _rand_bf16(2, nq, 2 * hd)[..., :hd]
+        K = _rand_bf16(2, nkv, maxlen, hd)
+        V = _rand_bf16(2, nkv, maxlen, hd)
+        pos = torch.tensor([3, 6], dtype=torch.long, device=DEV)
+        out = torch.empty(2, nq, hd, dtype=torch.bfloat16, device=DEV)
+        expected = torch.empty_like(out)
+        _op().decode_attn(q, K, V, pos, out, nq, nkv, hd, maxlen)
+        _op().decode_attn(q.contiguous(), K, V, pos, expected, nq, nkv, hd, maxlen)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
 class _BufferKVCache:
@@ -308,6 +315,8 @@ class _BufferKVCache:
 
     def __init__(self, keys, values, write_pos):
         self.keys, self.values, self._write_position = keys, values, write_pos
+        # One layer; the fused decode path reads the cache slots directly.
+        self._layers = [self]
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         rows = torch.arange(key_states.shape[0], device=key_states.device)
@@ -524,6 +533,92 @@ class TestRolloutTrainRollout:
 
         # still exercise the post-training generate path end-to-end
         rollout.generate(make_request(), greedy)
+
+    def test_grouped_gemm_small_batch(self):
+        """Grouped GEMM vs reference: the multi-matrix single-launch kernels
+        for decode batches 2..32 (concat and GLU-paired variants)."""
+        from deepspeed.module_inject import kernel_reference as ref
+        for M in (2, 8, 32):
+            K, fq, fk, fv = 128, 64, 32, 32
+            x = _rand_bf16(M, K)
+            qw, kw, vw = _rand_bf16(fq, K), _rand_bf16(fk, K), _rand_bf16(fv, K)
+            rq, rk, rv = ref.triple_gemm(x.float(), qw.float(), kw.float(), vw.float())
+            q_out, k_out, v_out = _op().triple_gemm(x, qw, kw, vw)
+            torch.testing.assert_close(q_out.float(), rq, atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(k_out.float(), rk, atol=5e-2, rtol=5e-2)
+            torch.testing.assert_close(v_out.float(), rv, atol=5e-2, rtol=5e-2)
+
+            gz_w, b_w, a_w = _rand_bf16(48, K), _rand_bf16(16, K), _rand_bf16(16, K)
+            cat = _op().quad_gemm(x, qw, gz_w, b_w, a_w)
+            torch.testing.assert_close(cat.float(),
+                                       ref.quad_gemm(x.float(), qw.float(), gz_w.float(), b_w.float(), a_w.float()),
+                                       atol=5e-2,
+                                       rtol=5e-2)
+
+            gw, uw = _rand_bf16(fq, K), _rand_bf16(fq, K)
+            glu = _op().dual_gemm_silu_mul(x, gw, uw)
+            torch.testing.assert_close(glu.float(),
+                                       ref.dual_gemm_silu_mul(x.float(), gw.float(), uw.float()),
+                                       atol=5e-2,
+                                       rtol=5e-2)
+
+    def test_grouped_gemm_rejects_out_of_range(self):
+        import pytest as _pytest
+        x = _rand_bf16(33, 64)
+        w = _rand_bf16(32, 64)
+        with _pytest.raises(RuntimeError):
+            _op().dual_gemm_silu_mul(x, w, w)
+
+    def test_grouped_linear_dispatcher(self):
+        """The portable interface entry: weight count x batch routing vs the
+        reference for every combination (gemv / grouped / aten composite)."""
+        from deepspeed.module_inject import kernel_reference as ref
+        op = _op()
+        K = 128
+        for M in (1, 8, 32, 64):
+            x = _rand_bf16(M, K) if M > 1 else _rand_bf16(K)
+            w1 = _rand_bf16(64, K)
+            out = op.grouped_linear(x, [w1], False)
+            if M > op.capabilities()["max_grouped_batch"]:
+                # composite route: bf16 matmul (same rounding as the route)
+                exp = torch.matmul(x.reshape(-1, K) if M > 1 else x, w1.t())
+            else:
+                exp = torch.matmul(x.float().reshape(-1, K), w1.float().t())
+            torch.testing.assert_close(out[0].float(), exp.float().reshape(out[0].shape), atol=5e-2, rtol=5e-2)
+
+            gw, uw = _rand_bf16(64, K), _rand_bf16(64, K)
+            out = op.grouped_linear(x, [gw, uw], True)
+            # batches above the grouped range route to the composite, whose
+            # matmul output rounds to bf16 before the epilogue (matching HF
+            # eager semantics); the fp32 reference skips that rounding, so
+            # anchor large batches on the same-dtype reference instead
+            if M > op.capabilities()["max_grouped_batch"]:
+                ref_glu = ref.dual_gemm_silu_mul(x if M > 1 else x, gw, uw)
+                torch.testing.assert_close(out[0].float(), ref_glu.float().reshape(out[0].shape), atol=5e-2, rtol=5e-2)
+            else:
+                ref_glu = ref.dual_gemm_silu_mul(x.float().reshape(-1, K) if M > 1 else x.float(), gw.float(),
+                                                 uw.float())
+                torch.testing.assert_close(out[0].float(), ref_glu.reshape(out[0].shape), atol=5e-2, rtol=5e-2)
+
+            kw, vw = _rand_bf16(32, K), _rand_bf16(32, K)
+            q, k, v = op.grouped_linear(x, [w1, kw, vw], False)
+            if M > op.capabilities()["max_grouped_batch"]:
+                rq = torch.matmul(x.reshape(-1, K) if M > 1 else x, w1.t())  # composite: bf16 matmul
+            else:
+                rq = torch.matmul(x.float().reshape(-1, K), w1.float().t())
+            torch.testing.assert_close(q.float(), rq.float().reshape(q.shape), atol=5e-2, rtol=5e-2)
+
+            z, b, a = _rand_bf16(48, K), _rand_bf16(16, K), _rand_bf16(16, K)
+            cat = op.grouped_linear(x, [w1, z, b, a], False)[0]
+            xq = x.reshape(-1, K) if M > 1 else x
+            if M > op.capabilities()["max_grouped_batch"]:
+                rc = ref.quad_gemm(xq, w1, z, b, a).float()  # composite: bf16 matmul
+                torch.testing.assert_close(cat.float(), rc.reshape(cat.shape), atol=5e-2, rtol=5e-2)
+            else:
+                rc = ref.quad_gemm(xq.float(), w1.float(), z.float(), b.float(), a.float())
+                torch.testing.assert_close(cat.float(), rc.reshape(cat.shape), atol=5e-2, rtol=5e-2)
+        caps = op.capabilities()
+        assert caps["max_grouped_batch"] >= 32 and "bf16" in list(caps["dtypes"])
 
 
 # ---------------------------------------------------------------------------
