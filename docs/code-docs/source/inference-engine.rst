@@ -70,10 +70,11 @@ logits after each replay. Greedy decoding (``temperature <= 0``) takes the
 argmax. Sampling applies the ``temperature``, ``top_k`` and ``top_p`` settings
 of ``SamplingConfig`` with Hugging Face's logits warpers, in the order
 ``generate()`` applies them, so both paths sample from the same distribution.
-Other settings from the model's ``generation_config``, such as a repetition
-penalty, are not applied on the graph path. Continuous batching, with or
-without graph capture, picks tokens the same way and also applies the model's
-repetition penalty before the warpers, as ``generate()`` does.
+``SamplingConfig.repetition_penalty`` (1.0, i.e. off, by default) is applied
+before the warpers on every path, as ``generate()`` does; the checkpoint's
+``generation_config`` does not change it. Other ``generation_config`` settings
+are not applied on the graph path. Continuous batching, with or without graph
+capture, picks tokens the same way.
 
 Shared Prompt Prefill
 ---------------------
@@ -98,7 +99,7 @@ on the regular ``HybridEngineRollout.generate(request, sampling)`` entry point.
 When unset, generation keeps its existing behavior. When set to a positive
 value, at most that many prompt rows are active at once; completed rows retire
 and pending rows are prefetched into the released slots. The returned
-``RolloutBatch`` remains in the original ``RolloutRequest`` row order.
+``RolloutBatch`` keeps the records in ``RolloutRequest`` order.
 When ``HybridEngineRolloutConfig(enable_cache_trimming=True)`` is enabled, the
 experimental path periodically trims unused cache columns from the left to
 keep long-running staggered-EOS workloads within the allocated cache span.
@@ -168,12 +169,108 @@ active rows while preserving its static tensor addresses. This mirrors the
 scheduler/cache separation used by systems such as vLLM and SGLang without
 copying their backend-specific kernels.
 
+HybridEngine Rollout Records
+----------------------------
+
+``RolloutRequest`` and ``RolloutBatch`` hold a list of ``RolloutRecord``. A
+record is one prompt and its rollout: ``prompt`` (chat messages, or text that
+is already rendered), ``tokens`` and ``attention_mask`` across every turn,
+``response`` and ``response_length``, a ``loss_mask`` over the response (1 on
+model tokens, 0 on tool output), ``rollout_log_probs``, ``reward`` and
+``status`` (``COMPLETED``, ``TRUNCATED`` or ``ABORTED``). Records generated
+from one prompt share its ``group_index``. A record without ``tokens`` is
+rendered with the tokenizer's chat template.
+
+``SamplingConfig(return_log_probs=True)`` records each generated token's
+log-probability under ``softmax(logits / temperature)``, the distribution a
+training forward pass can reproduce. ``SamplingConfig`` therefore rejects
+``return_log_probs`` combined with ``top_k`` or ``top_p`` when sampling, or with
+a repetition penalty, when the config is built.
+
+Multi-turn Rollout and Tool Calling
+-----------------------------------
+
+With ``RolloutConfig(multi_turn=True, max_turns=...)``, ``HybridEngineRollout``
+runs each record over several turns. Each turn generates for all records still
+active, parses tool calls from every response that ends in EOS, runs the tools,
+and appends their output as tool messages. A record ends ``COMPLETED`` when a
+turn calls no tool, and ``TRUNCATED`` when it runs out of turns or tokens.
+Model tokens are appended exactly as sampled; tool messages are tokenized from
+the chat template's own rendering of a tool turn, so earlier tokens are never
+re-tokenized.
+
+Tools subclass ``Tool``: set ``name``, ``description`` and a JSON-schema
+``parameters``, and implement ``async execute(arguments) -> str``. Pass them to
+``build_rollout(..., tools=[...])``. Prompts are rendered with the tools'
+specs, calls in one turn run concurrently, and parse errors, unknown tools and
+exceptions are returned to the model as text instead of failing the rollout.
+``RolloutConfig.tool_call_parser`` selects the call format: ``"hermes"``
+(Qwen2.5, Qwen3) or ``"qwen3_coder"`` (Qwen3-Coder, Qwen3.5).
+
+.. code-block:: python
+
+    from deepspeed.runtime.rollout import RolloutConfig, RolloutRequest, SamplingConfig, Tool, build_rollout
+    from deepspeed.runtime.rollout.base import RolloutRecord
+
+    class Calculator(Tool):
+        name = "calculator"
+        description = "Evaluates an arithmetic expression."
+        parameters = {"type": "object", "properties": {"expression": {"type": "string"}}}
+
+        async def execute(self, arguments):
+            return str(evaluate(arguments["expression"]))
+
+    rollout = build_rollout(RolloutConfig(multi_turn=True, max_turns=8), engine, tokenizer, tools=[Calculator()])
+    request = RolloutRequest(samples=[RolloutRecord(prompt=[{"role": "user", "content": question}])])
+    sampling = SamplingConfig(max_new_tokens=8192, max_new_tokens_per_turn=2048, n_samples_per_prompt=8,
+                              return_log_probs=True)
+    records = rollout.generate(request, sampling).samples
+
+``max_new_tokens`` caps a record's generated tokens over all turns,
+``max_new_tokens_per_turn`` caps each turn, and
+``RolloutConfig.max_context_len`` caps the whole conversation.
+``RolloutConfig.chat_template_kwargs`` is passed to every chat-template call,
+for example ``{"enable_thinking": False}``.
+
+GRPO Loss
+---------
+
+``group_advantages(records, rewards)`` normalizes each reward by the mean and
+standard deviation of its ``group_index`` group; ``scale_by_std=False`` keeps
+only the mean subtraction. ``grpo_policy_loss`` is the PPO-clip loss on
+per-token log-probs, with separate ``clip_low`` and ``clip_high`` ranges, an
+optional k3 KL penalty against reference log-probs, and ``"token_mean"`` or
+``"sample_mean"`` aggregation. It takes log-probs rather than logits, so it
+works with a plain ``log_softmax`` and with vocabulary-parallel log-prob ops.
+``old_log_probs_from_rollout`` lays out the records' ``rollout_log_probs`` like
+``ResponseTokenBatch``'s targets:
+
+.. code-block:: python
+
+    from deepspeed.runtime.rollout import (ResponseTokenBatch, group_advantages, grpo_policy_loss,
+                                           old_log_probs_from_rollout)
+
+    advantages = group_advantages(rollout_batch.samples, rewards).to(device)
+    response_batch = ResponseTokenBatch.from_rollout(rollout_batch, pad_token_id=tokenizer.pad_token_id, device=device)
+    logits = response_batch.select_causal_logits(model(input_ids=response_batch.input_ids,
+                                                       attention_mask=response_batch.attention_mask).logits)
+    log_probs = torch.log_softmax(logits.float() / temperature, dim=-1)
+    log_probs = log_probs.gather(-1, response_batch.target_ids.unsqueeze(-1)).squeeze(-1)
+    output = grpo_policy_loss(log_probs, old_log_probs_from_rollout(rollout_batch, device), advantages,
+                              response_batch.response_mask, clip_low=0.2, clip_high=0.28)
+    engine.backward(output.loss)
+
+``loss_sum`` and ``loss_normalizer`` are available for normalizing the loss
+across ranks; ``clip_fraction`` and ``kl`` are detached logging metrics.
+
 OPSD response-token utilities
 -----------------------------
 
-``ResponseTokenBatch.from_rollout`` derives causal training targets and a
-response-only loss mask from a ``RolloutBatch``. The mask excludes prompt and
-padding tokens while retaining an attended EOS token. Use
+``ResponseTokenBatch.from_rollout`` left-pads a ``RolloutBatch``'s records and
+derives causal training targets and a response-only loss mask. A record's
+response is its last ``response_length`` tokens. The mask excludes prompt and
+padding tokens, and response tokens whose ``loss_mask`` is 0 (multi-turn tool
+output), while retaining an attended EOS token. Use
 ``generalized_jsd_loss`` to compare aligned student and teacher logits on that
 mask:
 
@@ -181,7 +278,7 @@ mask:
 
     from deepspeed.runtime.rollout import ResponseTokenBatch, generalized_jsd_loss
 
-    response_batch = ResponseTokenBatch.from_rollout(rollout_batch)
+    response_batch = ResponseTokenBatch.from_rollout(rollout_batch, pad_token_id=tokenizer.pad_token_id)
     student_logits = response_batch.select_causal_logits(student_model(**model_inputs).logits)
     teacher_logits = aligned_teacher_logits
     loss_output = generalized_jsd_loss(
