@@ -1594,10 +1594,8 @@ def test_single_turn_applies_the_per_turn_cap():
 
 
 def test_rejects_non_positive_per_turn_cap():
-    rollout = HybridEngineRollout(_make_engine(), _make_tokenizer())
-
     with pytest.raises(ValueError, match="max_new_tokens_per_turn"):
-        rollout.generate(_make_request(), SamplingConfig(max_new_tokens=8, max_new_tokens_per_turn=0))
+        SamplingConfig(max_new_tokens=8, max_new_tokens_per_turn=0)
 
 
 def test_generate_keeps_ranks_in_lockstep_and_pads_after_eos():

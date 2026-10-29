@@ -61,6 +61,17 @@ class SamplingConfig:
     # Today a user who wants the model's penalty and needs no log-probs silently gets 1.0.
     repetition_penalty: float = 1.0
 
+    def __post_init__(self) -> None:
+        if self.max_new_tokens_per_turn is not None and self.max_new_tokens_per_turn <= 0:
+            raise ValueError("max_new_tokens_per_turn must be positive")
+        if self.return_log_probs:
+            # Log-probs are recorded under softmax(logits / temperature), which a training forward pass can
+            # reproduce. Top-k, top-p and the context-dependent repetition penalty sample from another distribution.
+            if self.temperature > 0.0 and (self.top_k > 0 or self.top_p < 1.0):
+                raise ValueError("return_log_probs requires top_k <= 0 and top_p == 1.0 when sampling")
+            if self.repetition_penalty != 1.0:
+                raise ValueError("return_log_probs requires repetition_penalty == 1.0")
+
 
 @dataclass
 class RolloutRecord:

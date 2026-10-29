@@ -59,6 +59,21 @@ def test_sampling_config_defaults():
     assert cfg.continuous_batch_size is None
 
 
+@pytest.mark.parametrize("unsupported", [{"top_k": 5}, {"top_p": 0.9}, {"repetition_penalty": 1.1}])
+def test_sampling_config_rejects_log_probs_a_training_forward_cannot_reproduce(unsupported):
+    # Rejected when the config is built, so no generation path can record log-probs of another distribution.
+    with pytest.raises(ValueError, match="return_log_probs requires"):
+        SamplingConfig(max_new_tokens=4, temperature=1.0, return_log_probs=True, **unsupported)
+
+
+def test_sampling_config_allows_log_probs_of_greedy_and_plain_temperature_sampling():
+    # Greedy decoding ignores top-k and top-p, so its log-probs are those of the raw logits either way.
+    SamplingConfig(max_new_tokens=4, temperature=0, top_k=5, top_p=0.9, return_log_probs=True)
+    SamplingConfig(max_new_tokens=4, temperature=0.7, return_log_probs=True)
+    # Without log-probs, every sampling option is allowed.
+    SamplingConfig(max_new_tokens=4, temperature=1.0, top_k=5, top_p=0.9, repetition_penalty=1.1)
+
+
 def test_continuous_batching_details_are_not_public_exports():
     assert "ContinuousBatchRequest" not in rollout_module.__all__
     assert "ContinuousBatchScheduler" not in rollout_module.__all__

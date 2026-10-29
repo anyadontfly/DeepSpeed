@@ -211,7 +211,6 @@ class HybridEngineRollout(RolloutEngine):
         samples = request.samples
         if not samples:
             return RolloutBatch(samples=[])
-        self._check_sampling(sampling)
         if sampling.max_new_tokens_per_turn is not None:
             max_new_tokens = min(sampling.max_new_tokens, sampling.max_new_tokens_per_turn)
             sampling = replace(sampling, max_new_tokens=max_new_tokens, max_new_tokens_per_turn=None)
@@ -333,7 +332,6 @@ class HybridEngineRollout(RolloutEngine):
         samples = request.samples
         if not samples:
             return RolloutBatch(samples=[])
-        self._check_sampling(sampling)
         device = get_accelerator().current_device_name()
         n = sampling.n_samples_per_prompt
         max_new_tokens = sampling.max_new_tokens
@@ -512,17 +510,6 @@ class HybridEngineRollout(RolloutEngine):
             self._last_profile = profile
 
         return RolloutBatch(samples=trajectories)
-
-    def _check_sampling(self, sampling: SamplingConfig) -> None:
-        if sampling.max_new_tokens_per_turn is not None and sampling.max_new_tokens_per_turn <= 0:
-            raise ValueError("max_new_tokens_per_turn must be positive")
-        return_log_probs = sampling.return_log_probs
-        if return_log_probs and sampling.temperature > 0.0 and (sampling.top_p < 1.0 or sampling.top_k > 0):
-            raise ValueError("return_log_probs requires top_p=1 and top_k<=0 when sampling")
-        if return_log_probs and sampling.repetition_penalty != 1.0:
-            # The penalty depends on the context and is applied before the
-            # log-probs are recorded; a training forward pass cannot reproduce it.
-            raise ValueError("return_log_probs requires repetition_penalty=1.0")
 
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
