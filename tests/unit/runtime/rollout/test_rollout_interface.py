@@ -15,6 +15,7 @@ import torch
 
 import deepspeed.runtime.rollout as rollout_module
 from deepspeed.runtime.rollout import (
+    GRPOLossOutput,
     JSDLossOutput,
     RolloutBatch,
     RolloutEngine,
@@ -23,6 +24,9 @@ from deepspeed.runtime.rollout import (
     SamplingConfig,
     build_rollout,
     generalized_jsd_loss,
+    group_advantages,
+    grpo_policy_loss,
+    old_log_probs_from_rollout,
 )
 from deepspeed.runtime.rollout.base import RolloutRecord
 
@@ -256,3 +260,154 @@ def test_engine_factory_hybrid_requires_student_engine():
 
     with pytest.raises(ValueError, match="needs both"):
         build_rollout(RolloutConfig(engine="hybrid_engine"))
+
+
+# --- GRPO ---------------------------------------------------------------------
+
+
+def _grouped(group_indices):
+    return [RolloutRecord(group_index=group_index) for group_index in group_indices]
+
+
+def test_group_advantages_normalize_within_each_prompt_group():
+    records = _grouped([0, 0, 1, 1, 2])
+    rewards = [1.0, -1.0, 1.0, 1.0, 1.0]
+
+    # Group 0: mean 0, sample std sqrt(2). Group 1 has equal rewards and group 2 one record, so both get 0.
+    expected = torch.tensor([2**-0.5, -2**-0.5, 0.0, 0.0, 0.0])
+    assert torch.allclose(group_advantages(records, rewards, eps=0.0), expected)
+    assert group_advantages(records, rewards, scale_by_std=False).tolist() == [1.0, -1.0, 0.0, 0.0, 0.0]
+
+
+def test_group_advantages_reject_ungrouped_records_and_mismatched_rewards():
+    with pytest.raises(ValueError, match="group_index"):
+        group_advantages([RolloutRecord()], [1.0])
+    with pytest.raises(ValueError, match="rewards"):
+        group_advantages(_grouped([0, 0]), [1.0])
+
+
+def test_old_log_probs_line_up_with_the_response_targets():
+    # A multi-turn record: model token, tool token (log-prob 0.0, loss mask 0), model token.
+    multi_turn = RolloutRecord(tokens=[5, 6, 7, 8, 9],
+                               attention_mask=[1] * 5,
+                               response_length=3,
+                               loss_mask=[1, 0, 1],
+                               rollout_log_probs=[-0.1, 0.0, -0.3])
+    single_turn = RolloutRecord(tokens=[5, 6, 7], attention_mask=[1] * 3, response_length=1, rollout_log_probs=[-0.2])
+    rollout = RolloutBatch(samples=[multi_turn, single_turn])
+
+    response_batch = ResponseTokenBatch.from_rollout(rollout)
+    old_log_probs = old_log_probs_from_rollout(rollout)
+
+    assert old_log_probs.shape == response_batch.response_mask.shape
+    # Under the response mask, each target gets the log-prob the rollout recorded for that token.
+    assert old_log_probs[response_batch.response_mask].tolist() == pytest.approx([-0.1, -0.3, -0.2])
+    assert response_batch.target_ids[response_batch.response_mask].tolist() == [7, 9, 7]
+
+
+def test_old_log_probs_need_the_rollout_to_record_them():
+    record = RolloutRecord(tokens=[5, 6], attention_mask=[1, 1], response_length=1)
+
+    with pytest.raises(ValueError, match="return_log_probs"):
+        old_log_probs_from_rollout(RolloutBatch(samples=[record]))
+
+
+def _ppo_case():
+    """Ratios 1.5 / 0.5 under advantages +1 and -1; the last token is masked out."""
+    old_log_probs = torch.zeros(2, 2)
+    log_probs = torch.log(torch.tensor([[1.5, 0.5], [0.5, 1.5]]))
+    advantages = torch.tensor([1.0, -1.0])
+    response_mask = torch.tensor([[True, True], [True, False]])
+    return log_probs, old_log_probs, advantages, response_mask
+
+
+@pytest.mark.parametrize(
+    "aggregation, expected_loss",
+    [
+        # Token losses: row 0 [-1.28 (ratio clipped at 1 + 0.28), -0.5], row 1 [0.8 (ratio clipped at 1 - 0.2)].
+        ("token_mean", (-1.28 - 0.5 + 0.8) / 3),
+        ("sample_mean", ((-1.28 - 0.5) / 2 + 0.8) / 2),
+    ],
+)
+def test_grpo_policy_loss_clips_both_sides_and_aggregates(aggregation, expected_loss):
+    log_probs, old_log_probs, advantages, response_mask = _ppo_case()
+
+    output = grpo_policy_loss(log_probs,
+                              old_log_probs,
+                              advantages,
+                              response_mask,
+                              clip_low=0.2,
+                              clip_high=0.28,
+                              aggregation=aggregation)
+
+    assert isinstance(output, GRPOLossOutput)
+    assert output.loss.item() == pytest.approx(expected_loss)
+    assert output.loss_sum.item() == pytest.approx(expected_loss * output.loss_normalizer.item())
+    assert output.loss_normalizer.item() == (3 if aggregation == "token_mean" else 2)
+    assert output.valid_token_count.item() == 3
+    # Two of the three response tokens were clipped.
+    assert output.clip_fraction.item() == pytest.approx(2 / 3)
+    assert output.kl is None
+
+
+def test_grpo_policy_loss_gradient_is_the_policy_gradient_inside_the_clip_range():
+    log_probs = torch.zeros(1, 2, requires_grad=True)
+    advantages = torch.tensor([2.0])
+
+    output = grpo_policy_loss(log_probs, torch.zeros(1, 2), advantages, torch.tensor([[True, False]]))
+    output.loss.backward()
+
+    # At ratio 1, d(-A * ratio) / d(log_prob) = -A on the one response token, and nothing on the masked one.
+    assert log_probs.grad.tolist() == [[-2.0, 0.0]]
+
+
+def test_grpo_policy_loss_adds_the_k3_kl_penalty():
+    log_probs = torch.zeros(1, 2)
+    ref_log_probs = torch.log(torch.tensor([[2.0, 1.0]]))
+    response_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    output = grpo_policy_loss(log_probs,
+                              log_probs,
+                              torch.zeros(1),
+                              response_mask,
+                              ref_log_probs=ref_log_probs,
+                              kl_coef=0.1)
+
+    # k3 = exp(d) - d - 1 with d = log(2) on the first token and 0 on the second.
+    token_kl = 1.0 - torch.log(torch.tensor(2.0)).item()
+    assert output.kl.item() == pytest.approx(token_kl / 2)
+    assert output.loss.item() == pytest.approx(0.1 * token_kl / 2)
+
+
+def test_grpo_policy_loss_of_an_empty_response_is_zero():
+    log_probs, old_log_probs, advantages, _ = _ppo_case()
+
+    for aggregation in ("token_mean", "sample_mean"):
+        output = grpo_policy_loss(log_probs,
+                                  old_log_probs,
+                                  advantages,
+                                  torch.zeros(2, 2, dtype=torch.bool),
+                                  aggregation=aggregation)
+        assert output.loss.item() == 0.0
+        assert output.loss_normalizer.item() == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs, message",
+    [
+        ({
+            "kl_coef": 0.1
+        }, "ref_log_probs"),
+        ({
+            "aggregation": "seq_sum"
+        }, "aggregation"),
+        ({
+            "clip_low": -0.1
+        }, "non-negative"),
+    ],
+)
+def test_grpo_policy_loss_rejects_invalid_options(kwargs, message):
+    log_probs, old_log_probs, advantages, response_mask = _ppo_case()
+
+    with pytest.raises(ValueError, match=message):
+        grpo_policy_loss(log_probs, old_log_probs, advantages, response_mask, **kwargs)
