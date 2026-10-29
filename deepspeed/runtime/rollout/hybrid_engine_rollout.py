@@ -1591,12 +1591,15 @@ class HybridEngineRollout(RolloutEngine):
 
     @staticmethod
     def _pad_after_eos(output_ids, response_start, eos_token_id, pad_token_id):
-        """Retain the first response EOS and pad every subsequent position."""
-        response_ids = output_ids[:, response_start:]
-        response_attn = (response_ids != pad_token_id)
+        """Retain the first response EOS and pad every subsequent position.
 
+        Only positions after a row's first EOS are padding: generation pads a
+        row only once it has ended, so a token equal to ``pad_token_id`` before
+        that was generated and stays part of the response.
+        """
+        response_ids = output_ids[:, response_start:]
         if eos_token_id is None or response_ids.shape[1] == 0:
-            return output_ids, response_attn.long()
+            return output_ids, torch.ones_like(response_ids)
 
         eos_ids = torch.as_tensor(eos_token_id, device=response_ids.device, dtype=response_ids.dtype).flatten()
         is_eos = (response_ids.unsqueeze(-1) == eos_ids).any(dim=-1)
@@ -1604,13 +1607,10 @@ class HybridEngineRollout(RolloutEngine):
         first_eos_idx = is_eos.long().argmax(dim=-1)
         positions = torch.arange(response_ids.shape[1], device=response_ids.device).unsqueeze(0)
         after_first_eos = has_eos.unsqueeze(1) & (positions > first_eos_idx.unsqueeze(1))
-        first_eos = has_eos.unsqueeze(1) & (positions == first_eos_idx.unsqueeze(1))
 
         output_ids = output_ids.clone()
         output_ids[:, response_start:].masked_fill_(after_first_eos, pad_token_id)
-        # EOS is a valid generated token even when pad_token_id == eos_token_id.
-        response_attn = ((response_ids != pad_token_id) | first_eos) & ~after_first_eos
-        return output_ids, response_attn.long()
+        return output_ids, (~after_first_eos).long()
 
     # ------------------------------------------------------------------
     # Graph capture decode loop

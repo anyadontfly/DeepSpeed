@@ -1089,9 +1089,9 @@ def test_generate_preserves_zero_pad_token_id():
 
     output = rollout.generate(_make_request(), _make_sampling())
 
-    # A generated pad id is padding, not a response token.
-    assert [sample.response_length for sample in output.samples] == [0, 0]
-    assert [sample.tokens for sample in output.samples] == [[0, 1, 2], [0, 3, 4]]
+    # A generated token equal to pad_token_id is still a response token: only positions after EOS are padding.
+    assert [sample.response_length for sample in output.samples] == [1, 1]
+    assert [sample.tokens for sample in output.samples] == [[0, 1, 2, 0], [0, 3, 4, 0]]
 
 
 def test_native_repeat_kv_cache_fp16_reverse_copy():
@@ -1685,6 +1685,16 @@ def test_pad_after_eos_keeps_eos_attended_when_eos_is_pad():
 
     assert padded.tolist() == [[10, 11, 5, 2, 2, 2]]
     assert response_attn.tolist() == [[1, 1, 0, 0]]
+
+
+def test_pad_after_eos_keeps_generated_pad_ids_before_eos():
+    # A model can sample the pad id; dropping it would shift every later token and its log-prob.
+    output_ids = torch.tensor([[10, 11, 0, 5, 2, 7]])
+
+    padded, response_attn = HybridEngineRollout._pad_after_eos(output_ids, 2, eos_token_id=2, pad_token_id=0)
+
+    assert padded.tolist() == [[10, 11, 0, 5, 2, 0]]
+    assert response_attn.tolist() == [[1, 1, 1, 0]]
 
 
 def test_pad_after_eos_supports_multiple_eos_ids():
