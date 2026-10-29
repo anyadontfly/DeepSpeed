@@ -1721,7 +1721,9 @@ def test_single_turn_records_log_probs_of_the_sampled_distribution():
                          num_attention_heads=2,
                          num_key_value_heads=1,
                          max_position_embeddings=64)
-    model = LlamaForCausalLM(config).eval()
+    # The rollout places prompts on the accelerator's current device, where the policy lives.
+    device = torch.device(get_accelerator().current_device_name())
+    model = LlamaForCausalLM(config).to(device).eval()
     engine = SimpleNamespace(module=model, zero_optimization_partition_weights=lambda: False)
     rollout = HybridEngineRollout(engine, _make_tokenizer())
     request = RolloutRequest(samples=[_prompt([5, 6, 7]), _prompt([0, 8, 9], [0, 1, 1])])
@@ -1733,12 +1735,15 @@ def test_single_turn_records_log_probs_of_the_sampled_distribution():
     for sample in samples:
         assert len(sample.rollout_log_probs) == len(sample.loss_mask) == sample.response_length > 0
         # Oracle: a full forward over the sample's real tokens, scored at the sampling temperature.
-        ids = torch.tensor([token for token, keep in zip(sample.tokens, sample.attention_mask) if keep])
+        ids = torch.tensor([token for token, keep in zip(sample.tokens, sample.attention_mask) if keep], device=device)
         with torch.no_grad():
             logits = model(ids[None]).logits[0].float() / sampling.temperature
         response = ids[-sample.response_length:]
         expected = torch.log_softmax(logits[-sample.response_length - 1:-1], dim=-1).gather(1, response[:, None])
-        torch.testing.assert_close(torch.tensor(sample.rollout_log_probs), expected.squeeze(1), atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(torch.tensor(sample.rollout_log_probs),
+                                   expected.squeeze(1).cpu(),
+                                   atol=1e-4,
+                                   rtol=1e-4)
 
 
 def _cache_config(head_dim=None):
