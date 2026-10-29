@@ -1631,6 +1631,11 @@ class HybridEngineRollout(RolloutEngine):
         eos_token_id = self.tokenizer.eos_token_id
         model_dtype = next(module.parameters()).dtype
         select_next_tokens = self._token_selector(sampling)
+        penalize = None
+        if sampling.repetition_penalty != 1.0:
+            from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
+            # generate() penalizes every token of the sequence so far, prompt included, before the warpers.
+            penalize = RepetitionPenaltyLogitsProcessor(sampling.repetition_penalty)
 
         # --- Prefill straight into the cache the graph decodes from ---
         # A second full-length cache for the prefill alone would double the KV memory of the call.
@@ -1655,7 +1660,10 @@ class HybridEngineRollout(RolloutEngine):
             **self._last_logits_kwargs(module),
         }
         prefill_out = module(prompt_ids, **prefill_kwargs)
-        next_token = select_next_tokens(prefill_out.logits[:, -1, :])
+        prefill_logits = prefill_out.logits[:, -1, :]
+        if penalize is not None:
+            prefill_logits = penalize(prompt_ids, prefill_logits.float())
+        next_token = select_next_tokens(prefill_logits)
         log_probs = [_chosen_log_probs(prefill_out.logits[:, -1, :], next_token, sampling.temperature)]
 
         output_ids = [prompt_ids, next_token]
@@ -1728,7 +1736,10 @@ class HybridEngineRollout(RolloutEngine):
 
             # Replay
             get_accelerator().replay_graph(graph)
-            next_token = select_next_tokens(static_logits[:, -1, :])
+            step_logits = static_logits[:, -1, :]
+            if penalize is not None:
+                step_logits = penalize(torch.cat(output_ids, dim=1), step_logits.float())
+            next_token = select_next_tokens(step_logits)
             output_ids.append(next_token)
             log_probs.append(_chosen_log_probs(static_logits[:, -1, :], next_token, sampling.temperature))
             eos_mask |= (next_token.squeeze(1) == eos_token_id)

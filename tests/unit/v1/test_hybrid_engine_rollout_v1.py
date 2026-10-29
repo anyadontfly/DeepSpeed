@@ -232,8 +232,10 @@ def _random_request(batch_size, prompt_len, device):
 
 
 @pytest.mark.parametrize("use_graph_capture, continuous_batch_size", [(True, None), (True, 8), (False, 8)])
-@pytest.mark.parametrize("temperature, top_k, top_p", [(1.0, 0, 1.0), (0.7, 5, 1.0), (1.0, 0, 0.8)])
-def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_graph_capture, continuous_batch_size):
+@pytest.mark.parametrize("temperature, top_k, top_p, repetition_penalty", [(1.0, 0, 1.0, 1.0), (0.7, 5, 1.0, 1.0),
+                                                                           (1.0, 0, 0.8, 1.0), (1.0, 0, 1.0, 1.3)])
+def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, repetition_penalty, use_graph_capture,
+                                             continuous_batch_size):
     accelerator = get_accelerator()
     if not accelerator.is_available() or accelerator.device_name() != "cuda":
         pytest.skip("CUDA is required for CUDA graph decode coverage")
@@ -248,6 +250,7 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
                               temperature=temperature,
                               top_k=top_k,
                               top_p=top_p,
+                              repetition_penalty=repetition_penalty,
                               continuous_batch_size=continuous_batch_size)
 
     torch.manual_seed(2)
@@ -262,6 +265,7 @@ def test_decode_sampling_matches_hf_generate(temperature, top_k, top_p, use_grap
                                   temperature=temperature,
                                   top_k=top_k,
                                   top_p=top_p,
+                                  repetition_penalty=repetition_penalty,
                                   eos_token_id=None,
                                   pad_token_id=0)
 
