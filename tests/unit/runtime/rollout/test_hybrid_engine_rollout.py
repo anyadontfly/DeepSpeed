@@ -1622,8 +1622,8 @@ def test_graph_generation_matches_hf_greedy_and_samples_with_temperature(batch_s
         assert sampled[:, 0].unique().numel() > 1
 
 
-def _tiny_qwen3_5(device, dtype):
-    """A random hybrid model: GDN (linear-attention) layers interleaved with full-attention layers."""
+def _tiny_qwen3_5(device, dtype, layer_types=None):
+    """A random Qwen3.5 model, by default hybrid: GDN (linear-attention) layers between full-attention layers."""
     modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
@@ -1632,7 +1632,7 @@ def _tiny_qwen3_5(device, dtype):
                                hidden_size=128,
                                intermediate_size=256,
                                num_hidden_layers=4,
-                               layer_types=["linear_attention", "full_attention"] * 2,
+                               layer_types=layer_types or ["linear_attention", "full_attention"] * 2,
                                num_attention_heads=4,
                                num_key_value_heads=2,
                                head_dim=64,
@@ -1654,14 +1654,21 @@ def _left_pad(prompts, device):
     return prompt_ids, prompt_attn
 
 
-@pytest.mark.parametrize("dtype, use_segki", [(torch.float32, False), (torch.bfloat16, True)])
-def test_graph_capture_decodes_left_padded_hybrid_rows_as_if_alone(dtype, use_segki):
-    """GDN layers have no way to skip pad tokens, so a left-padded row of a hybrid model must decode as it
-    would alone and unpadded: same sampled-token log-probs and, at temperature 0, the same tokens."""
+@pytest.mark.parametrize(
+    "dtype, use_segki, layer_types",
+    [
+        (torch.float32, False, None),
+        (torch.bfloat16, True, None),
+        # Not hybrid, but segment-KI's decode kernel still serves these layers, and it ignores the attention mask.
+        (torch.bfloat16, True, ["full_attention"] * 4),
+    ])
+def test_graph_capture_decodes_left_padded_rows_as_if_alone(dtype, use_segki, layer_types):
+    """Neither GDN layers nor segment-KI's decode kernel can skip pad tokens, so a left-padded row must decode as
+    it would alone and unpadded: same sampled-token log-probs and, at temperature 0, the same tokens."""
     if not torch.cuda.is_available():  #ignore-cuda
         pytest.skip("CUDA graph capture requires CUDA")
     device = torch.device("cuda")
-    model = _tiny_qwen3_5(device, dtype)
+    model = _tiny_qwen3_5(device, dtype, layer_types)
     # An EOS id that is never generated keeps every row decoding to max_new_tokens.
     rollout = HybridEngineRollout(SimpleNamespace(module=model), SimpleNamespace(pad_token_id=0, eos_token_id=-1),
                                   HybridEngineRolloutConfig(use_graph_capture=True, use_segki=use_segki))
@@ -1673,6 +1680,9 @@ def test_graph_capture_decodes_left_padded_hybrid_rows_as_if_alone(dtype, use_se
     with torch.no_grad():
         output_ids, log_probs = rollout._generate_graph(prompt_ids, prompt_attn, max_new_tokens, 0, temperature, model,
                                                         device)
+        # A failed kernel install falls back to the mask-aware forward, which would pass without exercising the kernel.
+        if use_segki:
+            assert any(getattr(layer, "_ki_attn_op", None) is not None for layer in model.modules())
         responses = output_ids[:, width:]
         for row, prompt in enumerate(prompts):
             # Oracle: a plain forward over the row alone, unpadded, scored the way training scores it.

@@ -2133,8 +2133,10 @@ class HybridEngineRollout(RolloutEngine):
 
         Hybrid models keep each row unpadded: its prompt fills cache slots
         ``0..len-1`` and it decodes from its own length, since GDN layers cannot
-        mask pad tokens out of their recurrent state. Other models keep the
-        left-padded layout and mask the pad slots.
+        mask pad tokens out of their recurrent state. So do padded batches with
+        segment-KI, whose decode kernel attends every slot up to ``write_pos``
+        and ignores the mask. Other models keep the left-padded layout and mask
+        the pad slots.
         """
         from deepspeed.utils.static_cache import DeepSpeedStaticCache, DSStaticGDNSlot
 
@@ -2165,7 +2167,9 @@ class HybridEngineRollout(RolloutEngine):
             dtype=model_dtype,
         )
         logits_kwargs = self._last_logits_kwargs(module)
-        if is_hybrid:
+        # An unpadded batch has no pad slots to leak, and prefilling straight into ds_cache needs no second cache.
+        strip_padding = is_hybrid or (self.use_segki and not prompt_attn.all())
+        if strip_padding:
             row_lengths = prompt_attn.sum(dim=1)
             prefill_logits = self._prefill_hybrid_rows(module, prompt_ids, row_lengths, ds_cache, logits_kwargs,
                                                        model_dtype, device)
