@@ -9,6 +9,7 @@ Provides:
   - :class:`ResponseTokenBatch` — response-only causal training targets
   - :func:`group_advantages`, :func:`grpo_policy_loss` — GRPO advantages and PPO-clip policy loss
   - :class:`HybridEngineRollout` — concrete implementation using DeepSpeed hybrid engine
+  - :class:`AutoTPRollout` — single-turn rollout with an AutoTP tensor-parallel copy of the model
   - :class:`Tool`, :class:`ToolSet`, :func:`parse_hermes_tool_calls`, :func:`parse_qwen3_coder_tool_calls` — tools
     for multi-turn rollout
   - :func:`build_rollout` — factory that selects the engine from config
@@ -22,12 +23,14 @@ from deepspeed.runtime.rollout.base import (
     SamplingConfig,
 )
 from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout
+from deepspeed.runtime.rollout.autotp_rollout import AutoTPRollout
 from deepspeed.runtime.rollout.grpo import (GRPOLossOutput, group_advantages, grpo_policy_loss,
                                             old_log_probs_from_rollout)
 from deepspeed.runtime.rollout.opsd import JSDLossOutput, ResponseTokenBatch, generalized_jsd_loss
 from deepspeed.runtime.rollout.tool import Tool, ToolCall, ToolSet, parse_hermes_tool_calls, parse_qwen3_coder_tool_calls
 
 __all__ = [
+    "AutoTPRollout",
     "GRPOLossOutput",
     "HybridEngineRollout",
     "JSDLossOutput",
@@ -55,7 +58,7 @@ def build_rollout(rollout_cfg, generation_engine=None, tokenizer=None, tools=Non
 
     Args:
         rollout_cfg: :class:`RolloutConfig` (or any object with an ``engine``
-            attribute set to ``"hybrid_engine"``).
+            attribute set to ``"hybrid_engine"`` or ``"autotp"``).
         generation_engine: DeepSpeed engine wrapping the student model.
         tokenizer: HuggingFace tokenizer.
         tools: Tools the model may call in multi-turn rollout: a
@@ -68,5 +71,11 @@ def build_rollout(rollout_cfg, generation_engine=None, tokenizer=None, tools=Non
         if tools is not None and not isinstance(tools, ToolSet):
             tools = ToolSet(tools)
         return HybridEngineRollout(engine=generation_engine, tokenizer=tokenizer, cfg=rollout_cfg, tools=tools)
+    if engine_name == "autotp":
+        if generation_engine is None or tokenizer is None:
+            raise ValueError("autotp rollout needs both generation_engine and tokenizer")
+        if tools is not None and not isinstance(tools, ToolSet):
+            tools = ToolSet(tools)
+        return AutoTPRollout(engine=generation_engine, tokenizer=tokenizer, cfg=rollout_cfg, tools=tools)
 
-    raise ValueError(f"Unknown rollout engine {engine_name!r}; choose from 'hybrid_engine'")
+    raise ValueError(f"Unknown rollout engine {engine_name!r}; choose from 'hybrid_engine', 'autotp'")

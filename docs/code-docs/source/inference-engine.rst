@@ -232,6 +232,32 @@ exceptions are returned to the model as text instead of failing the rollout.
 ``RolloutConfig.chat_template_kwargs`` is passed to every chat-template call,
 for example ``{"enable_thinking": False}``.
 
+AutoTP Rollout (experimental)
+-----------------------------
+
+``AutoTPRollout`` generates with a separate tensor-parallel copy of the training
+model, sharded across all ranks with AutoTP (``init_inference`` without kernel
+injection). Select it with ``build_rollout`` and ``engine="autotp"``.
+
+The training engine keeps its ZeRO layout. Call ``rollout.sync_weights(step)``
+after each optimizer step and before generating: it gathers each parameter's
+full fp32 master weight from ZeRO and copies this rank's AutoTP shard into the
+inference copy, in memory. Shards are cut with the layout metadata each AutoTP
+layer records, the same metadata used to restore a universal checkpoint into
+AutoTP. The construction runs one sync, so the copy never generates with its
+initial weights.
+
+All ranks form one tensor-parallel group, so they generate together: each
+rank's prompts are gathered, the union is generated once, and each rank gets
+back only its own samples. Every rank samples from the same seed, early stop at
+EOS is disabled so that all ranks run the same number of decode steps, and
+generation raises an error if the ranks' tokens differ.
+
+The inference copy costs roughly one more model's worth of memory on top of training,
+divided by the number of ranks. Only single-turn ``generate()`` rollout is
+supported; ``multi_turn``, ``use_graph_capture``, ``use_shared_prefill`` and
+continuous batching are rejected.
+
 GRPO Loss
 ---------
 
