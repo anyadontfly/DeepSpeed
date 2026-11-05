@@ -127,6 +127,12 @@ class DeepSpeedStaticLayer:
         # returns (position-based sizes are the DynamicLayer formula).
         return self.max_cache_len, 0
 
+    def get_query_offset(self) -> int | torch.Tensor:
+        # Mask construction precedes the current KV write, unlike get_seq_length().
+        if self._write_position is None:
+            return 0
+        return self._write_position
+
     def get_seq_length(self) -> int | torch.Tensor:
         # The write position doubles as the cached-token count (HF
         # cumulative_length semantics): the next token is written AT this
@@ -421,15 +427,25 @@ class DeepSpeedStaticCache:
             return layer.has_previous_state[state_idx]
         return self.get_seq_length(layer_idx) > 0
 
-    def get_query_offset(self, layer_idx: int = 0) -> int:
-        # transformers >= 5 cache protocol: the query offset equals the cached
-        # sequence length for non-MTP layers (see HF cache_utils).
-        return self.get_seq_length(layer_idx=layer_idx)
-
     def get_max_cache_shape(self, layer_idx: int = 0) -> int:
         if layer_idx >= len(self._layers):
             return self._max_cache_len
         return self._layers[layer_idx].get_max_cache_shape()
+
+    def get_query_offset(self, layer_idx: int = 0) -> int | torch.Tensor:
+        if layer_idx >= len(self._layers):
+            return 0
+        if isinstance(self._layers[layer_idx], DSStaticGDNSlot):
+            # A linear-attention slot never tracks positions, as in get_seq_length().
+            first = self._first_attention_idx()
+            if first is None:
+                return 0
+            layer_idx = first
+        offset = self._layers[layer_idx].get_query_offset()
+        if isinstance(offset, torch.Tensor) and offset.dim() == 1:
+            # As with get_seq_length(), per-row masks handle validity below this shared frontier.
+            return offset.max()
+        return offset
 
     def get_mask_sizes(self, query_length: int, layer_idx: int = 0) -> tuple[int, int]:
         # HF convention: mask builders sample shared masks with the default

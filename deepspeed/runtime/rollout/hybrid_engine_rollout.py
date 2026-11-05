@@ -7,11 +7,11 @@ Two generation paths:
   1. **model.generate()** (default): delegates to HuggingFace generate.
      Supports sampling (temperature, top_p) and greedy.
   2. **graph capture + DeepSpeedStaticCache**: greedy, or sampling with
-     temperature only (no top_p/top_k). Pre-allocates a StaticCache, captures
+     temperature, top_k and top_p. Pre-allocates a StaticCache, captures
      the decode forward pass with a CUDA graph, and replays it for each decode
      step.  Eliminates kernel launch overhead. With use_segki, segment-KI
      kernels replace parts of the decode step inside the captured graph.
-  3. **continuous batching (experimental)**: an opt-in bounded greedy path
+  3. **continuous batching (experimental)**: an opt-in bounded path, greedy or sampled like the graph path,
      selected through ``SamplingConfig.continuous_batch_size``.
 """
 
@@ -28,6 +28,7 @@ from typing import Optional
 import torch
 
 from deepspeed.accelerator import get_accelerator
+from deepspeed.utils import logger
 from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRecord, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
 from deepspeed.runtime.rollout.tool import TOOL_CALL_PARSERS, ToolSet
@@ -111,14 +112,53 @@ def _chosen_log_probs(logits, tokens):
     return torch.log_softmax(logits.float(), dim=-1).gather(1, tokens)
 
 
-def _select_next_tokens(logits, temperature):
-    """Pick the next tokens ``[B, 1]`` from ``logits`` ``[B, V]`` and return them with their log-probs."""
-    if temperature <= 0.0:
-        tokens = logits.argmax(dim=-1, keepdim=True)
-        return tokens, _chosen_log_probs(logits, tokens)
-    log_probs = torch.log_softmax(logits.float() / temperature, dim=-1)
-    tokens = torch.multinomial(log_probs.exp(), num_samples=1)
-    return tokens, log_probs.gather(1, tokens)
+def _token_selector(sampling):
+    """A function picking the next tokens ``[B, 1]`` from logits ``[B, V]``, returning them with their log-probs.
+
+    Tokens are picked outside any captured graph. Sampling applies temperature, top-k and top-p in the order
+    ``generate()`` applies them, in float32 as it does, so every path draws from the same distribution.
+    """
+    if sampling.temperature <= 0.0:
+
+        def select_greedy(logits):
+            tokens = logits.argmax(dim=-1, keepdim=True)
+            return tokens, _chosen_log_probs(logits, tokens)
+
+        return select_greedy
+
+    warpers = []
+    if sampling.top_k > 0 or sampling.top_p < 1.0:
+        from transformers.generation.logits_process import TopKLogitsWarper, TopPLogitsWarper
+        if sampling.top_k > 0:
+            warpers.append(TopKLogitsWarper(top_k=sampling.top_k))
+        if sampling.top_p < 1.0:
+            warpers.append(TopPLogitsWarper(top_p=sampling.top_p))
+
+    def select_sampled(logits):
+        scores = logits.float() / sampling.temperature
+        for warper in warpers:
+            # The warpers read only the scores, not the generated ids.
+            scores = warper(None, scores)
+        tokens = torch.multinomial(torch.softmax(scores, dim=-1), num_samples=1)
+        return tokens, torch.log_softmax(scores, dim=-1).gather(1, tokens)
+
+    return select_sampled
+
+
+def _checkpoint_repetition_penalty(module):
+    """The penalty in the model's ``generation_config``, which ``generate()`` applies too; 1.0 when it has none."""
+    penalty = getattr(getattr(module, "generation_config", None), "repetition_penalty", None)
+    return penalty if isinstance(penalty, (int, float)) else 1.0
+
+
+def _penalize_repeats(logits, input_ids, repetition_penalty):
+    """``logits`` with the tokens of ``input_ids`` penalized, in float32 and before any warper, as ``generate()`` does."""
+    if repetition_penalty == 1.0:
+        return logits
+    logits = logits.float()
+    scores = logits.gather(1, input_ids)
+    scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
+    return logits.scatter(1, input_ids, scores)
 
 
 def _has_linear_attention(config):
@@ -605,7 +645,10 @@ class HybridEngineRollout(RolloutEngine):
         device = accelerator.current_device_name()
         pad_token_id = self.tokenizer.pad_token_id
         eos_token_id = self.tokenizer.eos_token_id
-        temperature = sampling.temperature
+        select_next_tokens = _token_selector(sampling)
+        repetition_penalty = _checkpoint_repetition_penalty(module)
+        # With a repetition penalty, which tokens each row's trajectory holds, so a decode step needs no host read.
+        seen_tokens = None
         max_new_tokens = sampling.max_new_tokens
         stats = {"prefill_ms": 0.0, "decode_ms": 0.0, "tool_ms": 0.0, "steps": 0, "polls": 0, "turns": 0}
 
@@ -663,7 +706,13 @@ class HybridEngineRollout(RolloutEngine):
         decoded = torch.zeros((), dtype=torch.long, device=device)
         logits_kwargs = self._last_logits_kwargs(module)
 
+        def penalize_seen(logits, seen):
+            logits = logits.float()
+            penalized = torch.where(logits < 0, logits * repetition_penalty, logits / repetition_penalty)
+            return torch.where(seen, penalized, logits)
+
         def admit():
+            nonlocal seen_tokens
             free_rows = [row for row, owner in enumerate(row_owner) if owner is None]
             admitted = []
             while free_rows and pending:
@@ -690,7 +739,18 @@ class HybridEngineRollout(RolloutEngine):
                                                target_rows=target,
                                                cache_rows=num_rows,
                                                gdn_cache=gdn_cache)
-            first, first_log_probs = _select_next_tokens(logits, temperature)
+            if repetition_penalty != 1.0:
+                if seen_tokens is None:
+                    seen_tokens = torch.zeros(num_rows, logits.shape[-1], dtype=torch.bool, device=device)
+                seen_tokens[target] = False
+                for row, i, _ in admitted:
+                    sample = trajectories[i]
+                    real = [token for token, keep in zip(sample.tokens, sample.attention_mask) if keep]
+                    seen_tokens[row, torch.tensor(real, device=device)] = True
+                logits = penalize_seen(logits, seen_tokens[target])
+            first, first_log_probs = select_next_tokens(logits)
+            if repetition_penalty != 1.0:
+                seen_tokens[target] = seen_tokens[target].scatter(1, first, True)
             limits = torch.tensor([budget for _, _, budget in admitted], device=device)
             # The turn's context, and the slot its first decode input is written to.
             static_attn[target, 0, 0, :] = slots.unsqueeze(0) <= lengths.unsqueeze(1)
@@ -758,7 +818,11 @@ class HybridEngineRollout(RolloutEngine):
                 logits = static_logits[:, -1, :]
             else:
                 logits = forward().logits[:, -1, :]
-            tokens, log_probs = _select_next_tokens(logits, temperature)
+            if repetition_penalty != 1.0:
+                logits = penalize_seen(logits, seen_tokens)
+            tokens, log_probs = select_next_tokens(logits)
+            if repetition_penalty != 1.0:
+                seen_tokens.scatter_(1, tokens, True)
             # Record each decoding row's token at its next position; other rows keep their buffers.
             position = num_generated.clamp(max=turn_len - 1).unsqueeze(1)
             recording = active.unsqueeze(1)
@@ -935,28 +999,18 @@ class HybridEngineRollout(RolloutEngine):
         return_log_probs = sampling.return_log_probs
         if return_log_probs and sampling.temperature > 0.0 and (sampling.top_p < 1.0 or sampling.top_k > 0):
             raise ValueError("return_log_probs requires top_p=1 and top_k<=0 when sampling")
-        if return_log_probs and sampling.repetition_penalty != 1.0:
+        repetition_penalty = _checkpoint_repetition_penalty(self.engine.module)
+        if return_log_probs and repetition_penalty != 1.0:
             # The penalty depends on the context and is applied before the
             # log-probs are recorded; a training forward pass cannot reproduce it.
-            raise ValueError("return_log_probs requires repetition_penalty=1.0")
-        if self.use_graph_capture:
-            # The graph decode loop samples from softmax(logits / temperature) only.
-            if sampling.temperature > 0.0 and (sampling.top_p < 1.0 or sampling.top_k > 0):
-                raise ValueError("CUDA graph capture supports temperature sampling only; set top_p=1 and top_k<=0")
-            if sampling.repetition_penalty != 1.0:
-                raise ValueError("CUDA graph capture does not support repetition_penalty; set it to 1.0")
+            logger.warning_once(f"return_log_probs with the checkpoint's repetition_penalty={repetition_penalty}: a "
+                                "training forward pass cannot reproduce the recorded log-probs")
 
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
         if self.use_graph_capture:
-            return self._generate_graph(prompt_ids,
-                                        prompt_attn,
-                                        max_new_tokens,
-                                        pad_token_id,
-                                        sampling.temperature,
-                                        module,
-                                        prompt_ids.device,
-                                        return_log_probs=sampling.return_log_probs)
+            return self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, sampling, module,
+                                        prompt_ids.device)
 
         # ZeRO-3 gathers parameters during each decode forward, so every
         # data-parallel rank must run the same number of decode steps and
@@ -972,7 +1026,6 @@ class HybridEngineRollout(RolloutEngine):
             "temperature": temperature if do_sample else 1.0,
             "top_p": sampling.top_p if do_sample else 1.0,
             "pad_token_id": pad_token_id,
-            "repetition_penalty": sampling.repetition_penalty,
         }
         if do_sample:
             generate_kwargs["top_k"] = max(sampling.top_k, 0)
@@ -995,9 +1048,9 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def _generate_continuous(self, samples, sampling, max_batch_size):
-        """Generate independent greedy responses for ``samples`` in an experimental continuous batch.
+        """Generate independent responses for ``samples`` in an experimental continuous batch.
 
-        Continuous batching currently requires greedy decoding and one sample
+        Continuous batching currently requires one sample
         per prompt. Completed rows retire immediately and pending prompts
         prefill into the released rows before the next decode step.
         """
@@ -1054,7 +1107,8 @@ class HybridEngineRollout(RolloutEngine):
         scheduler = ContinuousBatchScheduler(max_batch_size, sampling.max_new_tokens)
         request_by_id = {}
         responses = {}
-        # Each response token's log-prob under the raw logits: greedy decoding is temperature 1.
+        select_next_tokens = _token_selector(sampling)
+        # Each response token's log-prob under the distribution it was picked from.
         response_log_probs = {}
         request_order = (sorted(range(len(requests)), key=lambda request_id: -prompt_lengths[request_id])
                          if self.align_decode_fronts else range(len(requests)))
@@ -1187,6 +1241,7 @@ class HybridEngineRollout(RolloutEngine):
                 prompt_lengths,
                 model_dtype,
                 device,
+                sampling,
                 self.align_decode_fronts,
                 profile,
             )
@@ -1220,16 +1275,17 @@ class HybridEngineRollout(RolloutEngine):
                     position_ids=position_ids,
                 )
                 self._profile_end(profile, "decode_forward_ms", decode_start, count="num_decode_forwards")
-                decoded = self._continuous_next_tokens(
+                decoded, decoded_log_probs_all = self._continuous_next_tokens(
                     output.logits[:, -1, :],
                     survivor_ids,
                     request_by_id,
                     responses,
-                    sampling.repetition_penalty,
+                    _checkpoint_repetition_penalty(module),
+                    select_next_tokens,
                 )
                 stats["decode_steps"] += 1
                 decoded_tokens = dict(zip(survivor_ids, decoded.split(1, dim=0)))
-                decoded_log_prob_rows = _chosen_log_probs(output.logits[:, -1, :], decoded).split(1, dim=0)
+                decoded_log_prob_rows = decoded_log_probs_all.split(1, dim=0)
                 decoded_log_probs = dict(zip(survivor_ids, decoded_log_prob_rows))
                 for request_id in survivor_ids:
                     logical_positions[request_id] += 1
@@ -1274,7 +1330,7 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def _generate_continuous_graph(self, trajectories, requests, sampling, max_batch_size):
-        """Run continuous greedy decoding with a fixed-capacity CUDA graph.
+        """Run continuous decoding with a fixed-capacity CUDA graph.
 
         Scheduler slots stay attached to physical cache rows for their whole
         lifetime. Retired rows are masked until a new prompt is prefetched into
@@ -1312,7 +1368,8 @@ class HybridEngineRollout(RolloutEngine):
         prompt_lengths = {request_id: prompt_len for request_id in range(len(requests))}
         request_by_id = {}
         responses = {}
-        # Each response token's log-prob under the raw logits: greedy decoding is temperature 1.
+        select_next_tokens = _token_selector(sampling)
+        # Each response token's log-prob under the distribution it was picked from.
         response_log_probs = {}
         for request_id, request in enumerate(requests):
             scheduler.submit(ContinuousBatchRequest(request_id))
@@ -1393,6 +1450,7 @@ class HybridEngineRollout(RolloutEngine):
                     prompt_lengths,
                     model_dtype,
                     device,
+                    sampling,
                     profile=profile,
                     target_slots=tuple(admitted_slots),
                 )
@@ -1423,14 +1481,15 @@ class HybridEngineRollout(RolloutEngine):
                 decode_logits = torch.cat(
                     [static_logits[slot_by_request[request_id], -1, :].unsqueeze(0) for request_id in decode_ids],
                     dim=0)
-                decoded = self._continuous_next_tokens(
+                decoded, decoded_log_probs_all = self._continuous_next_tokens(
                     decode_logits,
                     decode_ids,
                     request_by_id,
                     responses,
-                    sampling.repetition_penalty,
+                    _checkpoint_repetition_penalty(module),
+                    select_next_tokens,
                 )
-                decoded_log_prob_rows = _chosen_log_probs(decode_logits, decoded).split(1, dim=0)
+                decoded_log_prob_rows = decoded_log_probs_all.split(1, dim=0)
                 for request_id, token, log_prob in zip(decode_ids, decoded.split(1, dim=0), decoded_log_prob_rows):
                     decoded_tokens[request_id] = token
                     next_log_probs[request_id] = log_prob
@@ -1641,8 +1700,6 @@ class HybridEngineRollout(RolloutEngine):
 
         if sampling.max_new_tokens <= 0:
             raise ValueError("max_new_tokens must be positive")
-        if sampling.temperature > 0:
-            raise ValueError("continuous batching currently supports greedy decoding only")
         if sampling.n_samples_per_prompt != 1:
             raise ValueError("continuous batching currently supports one sample per prompt")
 
@@ -1667,6 +1724,7 @@ class HybridEngineRollout(RolloutEngine):
                             prompt_lengths,
                             model_dtype,
                             device,
+                            sampling,
                             align_decode_fronts=False,
                             profile=None,
                             target_slots=None):
@@ -1691,6 +1749,7 @@ class HybridEngineRollout(RolloutEngine):
                 prompt_attention,
                 model_dtype,
                 device,
+                sampling,
             )
             self._profile_end(profile, "prefill_forward_ms", prefill_start, count="num_prefill_forwards")
             cache_copy_start = self._profile_start(profile)
@@ -1728,6 +1787,7 @@ class HybridEngineRollout(RolloutEngine):
                 prompt_attention,
                 model_dtype,
                 device,
+                sampling,
             )
             self._profile_end(profile, "prefill_forward_ms", prefill_start, count="num_prefill_forwards")
             cache_copy_start = self._profile_start(profile)
@@ -1810,7 +1870,8 @@ class HybridEngineRollout(RolloutEngine):
             "continuous_batch_size": max_batch_size,
         }
 
-    def _continuous_prefill_cache(self, module, static_cache_type, prompt_ids, prompt_attention, model_dtype, device):
+    def _continuous_prefill_cache(self, module, static_cache_type, prompt_ids, prompt_attention, model_dtype, device,
+                                  sampling):
         position_ids = self._prefill_position_ids(prompt_attention)
         if getattr(module, "_supports_cache_class", None) is None:
             pad_token_id = self.tokenizer.pad_token_id
@@ -1821,14 +1882,17 @@ class HybridEngineRollout(RolloutEngine):
                 attention_mask=prompt_attention,
                 position_ids=position_ids,
                 max_new_tokens=1,
-                do_sample=False,
                 eos_token_id=None,
                 pad_token_id=pad_token_id,
                 return_dict_in_generate=True,
                 output_logits=True,
+                **self._hf_sampling_kwargs(sampling),
             )
             tokens = prefill_output.sequences[:, -1:]
-            return tokens, _chosen_log_probs(prefill_output.logits[-1], tokens), prefill_output.past_key_values
+            # output_logits holds the raw logits; return_log_probs rules out every other setting that changes them.
+            scale = sampling.temperature if sampling.temperature > 0.0 else 1.0
+            log_probs = _chosen_log_probs(prefill_output.logits[-1] / scale, tokens)
+            return tokens, log_probs, prefill_output.past_key_values
 
         prompt_len = prompt_ids.shape[1]
         prefill_cache = self._create_static_cache(static_cache_type, module.config, prompt_ids.shape[0], prompt_len,
@@ -1843,24 +1907,33 @@ class HybridEngineRollout(RolloutEngine):
             position_ids=position_ids,
             **self._last_logits_kwargs(module),
         )
-        last_logits = prefill_output.logits[:, -1, :]
-        tokens = last_logits.argmax(dim=-1, keepdim=True)
-        return tokens, _chosen_log_probs(last_logits, tokens), prefill_cache
+        last_logits = _penalize_repeats(prefill_output.logits[:, -1, :], prompt_ids,
+                                        _checkpoint_repetition_penalty(module))
+        tokens, log_probs = _token_selector(sampling)(last_logits)
+        return tokens, log_probs, prefill_cache
 
     @staticmethod
-    def _continuous_next_tokens(logits, request_ids, request_by_id, responses, repetition_penalty):
+    def _continuous_next_tokens(logits, request_ids, request_by_id, responses, repetition_penalty, select_next_tokens):
         if repetition_penalty == 1.0:
-            return logits.argmax(dim=-1, keepdim=True)
+            return select_next_tokens(logits)
 
-        next_tokens = []
+        penalized = []
         for row, request_id in enumerate(request_ids):
             input_ids = torch.cat((request_by_id[request_id].prompt_ids, *responses[request_id]), dim=1)
-            row_logits = logits[row:row + 1].clone()
-            scores = row_logits.gather(1, input_ids)
-            scores = torch.where(scores < 0, scores * repetition_penalty, scores / repetition_penalty)
-            row_logits.scatter_(1, input_ids, scores)
-            next_tokens.append(row_logits.argmax(dim=-1, keepdim=True))
-        return torch.cat(next_tokens, dim=0)
+            penalized.append(_penalize_repeats(logits[row:row + 1], input_ids, repetition_penalty))
+        return select_next_tokens(torch.cat(penalized, dim=0))
+
+    @staticmethod
+    def _hf_sampling_kwargs(sampling):
+        """Hugging Face ``generate()`` arguments for ``sampling``; ``temperature <= 0`` is greedy."""
+        if sampling.temperature <= 0.0:
+            return {"do_sample": False, "temperature": 1.0, "top_p": 1.0}
+        return {
+            "do_sample": True,
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "top_k": max(sampling.top_k, 0),
+        }
 
     @staticmethod
     def _prefill_position_ids(attention_mask):
@@ -1986,12 +2059,15 @@ class HybridEngineRollout(RolloutEngine):
 
     @staticmethod
     def _pad_after_eos(output_ids, response_start, eos_token_id, pad_token_id):
-        """Retain the first response EOS and pad every subsequent position."""
-        response_ids = output_ids[:, response_start:]
-        response_attn = (response_ids != pad_token_id)
+        """Retain the first response EOS and pad every subsequent position.
 
+        Only positions after a row's first EOS are padding: generation pads a
+        row only once it has ended, so a token equal to ``pad_token_id`` before
+        that was generated and stays part of the response.
+        """
+        response_ids = output_ids[:, response_start:]
         if eos_token_id is None or response_ids.shape[1] == 0:
-            return output_ids, response_attn.long()
+            return output_ids, torch.ones_like(response_ids)
 
         eos_ids = torch.as_tensor(eos_token_id, device=response_ids.device, dtype=response_ids.dtype).flatten()
         is_eos = (response_ids.unsqueeze(-1) == eos_ids).any(dim=-1)
@@ -1999,13 +2075,10 @@ class HybridEngineRollout(RolloutEngine):
         first_eos_idx = is_eos.long().argmax(dim=-1)
         positions = torch.arange(response_ids.shape[1], device=response_ids.device).unsqueeze(0)
         after_first_eos = has_eos.unsqueeze(1) & (positions > first_eos_idx.unsqueeze(1))
-        first_eos = has_eos.unsqueeze(1) & (positions == first_eos_idx.unsqueeze(1))
 
         output_ids = output_ids.clone()
         output_ids[:, response_start:].masked_fill_(after_first_eos, pad_token_id)
-        # EOS is a valid generated token even when pad_token_id == eos_token_id.
-        response_attn = ((response_ids != pad_token_id) | first_eos) & ~after_first_eos
-        return output_ids, response_attn.long()
+        return output_ids, (~after_first_eos).long()
 
     # ------------------------------------------------------------------
     # Graph capture decode loop
@@ -2132,16 +2205,8 @@ class HybridEngineRollout(RolloutEngine):
         except Exception:
             module._ki_fused_norm_patched = 0
 
-    def _generate_graph(self,
-                        prompt_ids,
-                        prompt_attn,
-                        max_new_tokens,
-                        pad_token_id,
-                        temperature,
-                        module,
-                        device,
-                        return_log_probs=True):
-        """Decode with DeepSpeedStaticCache + CUDA graph capture; ``temperature <= 0`` is greedy.
+    def _generate_graph(self, prompt_ids, prompt_attn, max_new_tokens, pad_token_id, sampling, module, device):
+        """Decode with DeepSpeedStaticCache + CUDA graph capture, greedy or sampled per ``sampling``.
 
         Only the decode forward is captured. Tokens are chosen eagerly from the
         graph's output logits after each replay, so sampling draws fresh random
@@ -2169,6 +2234,8 @@ class HybridEngineRollout(RolloutEngine):
         if isinstance(getattr(module, "config", None), dict):
             from types import SimpleNamespace
             module.config = SimpleNamespace(**module.config)
+        if getattr(module.config, "_attn_implementation", None) == "flash_attention_2":
+            raise ValueError("graph capture does not support flash_attention_2")
         is_hybrid = _has_linear_attention(module.config)
         rows = torch.arange(batch_size, device=device)
 
@@ -2215,7 +2282,11 @@ class HybridEngineRollout(RolloutEngine):
             # Left-padded rows all decode from the end of the padded prompt; the mask hides their pad slots.
             decode_start = torch.full((batch_size, ), prompt_len, dtype=torch.long, device=device)
             prompt_slots = prompt_attn.bool()
-        next_token, first_log_probs = _select_next_tokens(prefill_logits, temperature)
+        select_next_tokens = _token_selector(sampling)
+        repetition_penalty = _checkpoint_repetition_penalty(module)
+        # generate() penalizes the sequence so far, prompt included.
+        next_token, first_log_probs = select_next_tokens(
+            _penalize_repeats(prefill_logits, prompt_ids, repetition_penalty))
         log_probs = [first_log_probs]
 
         output_ids = [prompt_ids, next_token]
@@ -2233,7 +2304,6 @@ class HybridEngineRollout(RolloutEngine):
         static_attn = torch.zeros(batch_size, 1, 1, max_len, dtype=torch.bool, device=device)
         static_attn[:, 0, 0, :prompt_len] = prompt_slots
         static_attn[rows, 0, 0, decode_start] = True
-        decode_mask = {"full_attention": static_attn, "linear_attention": None} if is_hybrid else static_attn
         # Views of write_pos, not copies: the captured forwards read this memory, and the in-graph step kernel
         # advances write_pos itself, so replays see the new position without host-side updates.
         static_cache_pos = write_pos[:1]
@@ -2262,9 +2332,10 @@ class HybridEngineRollout(RolloutEngine):
                 recurrent_state.copy_(recurrent_state0)
 
         # segment-KI's step kernel folds argmax and the buffer updates into the graph. It handles one greedy row
-        # of CUDA bf16 logits and records no log-probs.
+        # of CUDA bf16 logits, records no log-probs and applies no repetition penalty.
         step_op = None
-        if self.use_segki and batch_size == 1 and temperature <= 0.0 and not return_log_probs:
+        if (self.use_segki and batch_size == 1 and sampling.temperature <= 0.0 and not sampling.return_log_probs
+                and repetition_penalty == 1.0):
             try:
                 from deepspeed.ops.module_inject import get_fused_glu_op
                 candidate = get_fused_glu_op()
@@ -2273,6 +2344,19 @@ class HybridEngineRollout(RolloutEngine):
             except Exception:
                 step_op = None
         step_kernel_mounted = False
+
+        # Standard models get a pre-built 4-D additive mask: Transformers checks a 2-D mask on the host during
+        # capture, and eager attention adds its mask to the attention weights, so a boolean one would be wrong.
+        # The step kernel reveals positions in static_attn from inside the graph, so it keeps that buffer.
+        static_causal_attn = None
+        if is_hybrid:
+            decode_mask = {"full_attention": static_attn, "linear_attention": None}
+        elif step_op is not None:
+            decode_mask = static_attn
+        else:
+            static_causal_attn = torch.zeros((batch_size, 1, 1, max_len), dtype=model_dtype, device=device)
+            self._update_static_causal_attention(static_attn[:, 0, 0], static_causal_attn)
+            decode_mask = static_causal_attn
 
         # Remove forward hooks (they synchronize — illegal during graph capture)
         saved_pre = dict(module._forward_pre_hooks)
@@ -2358,10 +2442,15 @@ class HybridEngineRollout(RolloutEngine):
             static_token.copy_(next_token)
             torch.add(decode_start, step, out=write_pos)
             static_attn[rows, 0, 0, write_pos] = True
+            if static_causal_attn is not None:
+                self._update_static_causal_attention(static_attn[:, 0, 0], static_causal_attn)
 
             # Replay
             get_accelerator().replay_graph(graph)
-            next_token, step_log_probs = _select_next_tokens(static_logits[:, -1, :], temperature)
+            step_logits = static_logits[:, -1, :]
+            if repetition_penalty != 1.0:
+                step_logits = _penalize_repeats(step_logits, torch.cat(output_ids, dim=1), repetition_penalty)
+            next_token, step_log_probs = select_next_tokens(step_logits)
             output_ids.append(next_token)
             log_probs.append(step_log_probs)
             eos_mask |= (next_token.squeeze(1) == eos_token_id)

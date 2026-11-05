@@ -56,10 +56,6 @@ class SamplingConfig:
     n_samples_per_prompt: int = 1
     continuous_batch_size: Optional[int] = None
     return_log_probs: bool = False
-    # Passed explicitly so a checkpoint's generation_config never applies silently; 1.0 disables the penalty.
-    # TODO: Default to the checkpoint's generation_config value, forcing 1.0 only with return_log_probs.
-    # Today a user who wants the model's penalty and needs no log-probs silently gets 1.0.
-    repetition_penalty: float = 1.0
 
 
 @dataclass

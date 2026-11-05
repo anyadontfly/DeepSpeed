@@ -113,8 +113,12 @@ steps.
 Segment injection requires a CUDA accelerator and currently targets
 single-GPU. Greedy decoding of a single row without log-probs gets a fully
 fused decode step inside the captured graph; otherwise tokens are chosen in
-Python after each replay, so temperature sampling and log-probs work as on the
-plain graph path. On hybrid models (linear-attention layers, e.g. Qwen3.5),
+Python after each replay, so sampling and log-probs work as on the plain graph
+path. The graph path, and continuous batching with or without graphs, apply
+``temperature``, ``top_k`` and ``top_p`` from ``SamplingConfig``, and the
+``repetition_penalty`` from the model's ``generation_config``, in the order
+``generate()`` applies them. ``return_log_probs`` warns about a penalty other
+than 1.0, since a training forward pass cannot reproduce those log-probs. On hybrid models (linear-attention layers, e.g. Qwen3.5),
 padded prompts use HF ``generate`` instead of the graph path. Fused projections
 are never applied to layers carrying tensor-parallel collectives.
 
@@ -145,7 +149,7 @@ configured capacity.
 
 The experimental path intentionally does not implement paged attention or change the
 default generation semantics. It currently requires one padded prompt width for
-all rows, a model with cache-class support, greedy decoding, and one sample per
+all rows, a model with cache-class support, and one sample per
 prompt. Shared prompt prefill is rejected until the scheduling semantics are
 validated on real workloads. Models that explicitly declare no cache-class
 support are rejected; models with unknown support should be validated against
@@ -195,6 +199,16 @@ captured decode uses a four-dimensional additive attention mask.
 active rows while preserving its static tensor addresses. This mirrors the
 scheduler/cache separation used by systems such as vLLM and SGLang without
 copying their backend-specific kernels.
+
+``DeepSpeedStaticCache.get_query_offset(layer_idx)`` supports the causal-mask
+query-offset interface used by Transformers 5.20. It returns zero before a
+write position is supplied, the scalar write position for fixed-batch decoding,
+or the largest per-row write position for continuous batching. Per-row attention
+masks determine which cache entries are valid below that shared frontier.
+The offset excludes the current write, unlike ``get_seq_length()``; querying it
+does not advance the cache or synchronize a device tensor to the host.
+This is a targeted query-offset compatibility fix, not a guarantee of support
+for every Transformers 5.20 cache API.
 
 OPSD response-token utilities
 -----------------------------
