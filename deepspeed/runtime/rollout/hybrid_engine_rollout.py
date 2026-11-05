@@ -344,7 +344,7 @@ class HybridEngineRollout(RolloutEngine):
 
         forward_profiler = None
         forward_profile_handles = []
-        if self.enable_profiling and not self.use_graph_capture:
+        if self.enable_profiling and not self._graph_capture_enabled():
             forward_profiler = _ForwardProfiler(accelerator)
             forward_profile_handles = forward_profiler.register(module)
 
@@ -500,7 +500,7 @@ class HybridEngineRollout(RolloutEngine):
 
             forward_profiler = None
             forward_profile_handles = []
-            if self.enable_profiling and not self.use_graph_capture:
+            if self.enable_profiling and not self._graph_capture_enabled():
                 forward_profiler = _ForwardProfiler(accelerator)
                 forward_profile_handles = forward_profiler.register(module)
 
@@ -897,13 +897,14 @@ class HybridEngineRollout(RolloutEngine):
                 update_sample_from_response(trajectories[i], response, log_probs, tool_response, self.tokenizer)
                 pending.appendleft(i)
 
+        use_graph_capture = self._graph_capture_enabled()
         tool_loop = asyncio.new_event_loop()
         tool_thread = threading.Thread(target=tool_loop.run_forever, name="rollout-tools", daemon=True)
         tool_thread.start()
         self._install_segki_decode(module, write_pos, capacity, model_dtype, device)
         try:
             while any(owner is not None for owner in row_owner) or pending or tools_in_flight:
-                if admit() and self.use_graph_capture and graph is None:
+                if admit() and use_graph_capture and graph is None:
                     graph, static_logits = capture()
                 rows_held = sum(owner is not None for owner in row_owner)
                 if rows_held:
@@ -1010,9 +1011,19 @@ class HybridEngineRollout(RolloutEngine):
             logger.warning_once(f"return_log_probs with repetition_penalty={repetition_penalty}: a training forward "
                                 "pass cannot reproduce the recorded log-probs")
 
+    def _graph_capture_enabled(self):
+        """Whether to decode with a captured graph; a backend that only exposes a graph API has not opted in."""
+        if not self.use_graph_capture:
+            return False
+        if get_accelerator().is_graph_capture_supported():
+            return True
+        logger.warning_once("HybridEngineRollout: graph capture is not supported on the current accelerator; "
+                            "falling back to eager generation.")
+        return False
+
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
-        if self.use_graph_capture:
+        if self._graph_capture_enabled():
             return self._generate_graph(prompt_ids, prompt_attn, max_new_tokens, pad_token_id, sampling, module,
                                         prompt_ids.device)
 
@@ -1074,7 +1085,7 @@ class HybridEngineRollout(RolloutEngine):
         requests = tuple(
             _PromptRow(prompt_ids[index:index + 1], prompt_attention_mask[index:index + 1])
             for index in range(len(trajectories)))
-        if self.use_graph_capture:
+        if self._graph_capture_enabled():
             return self._generate_continuous_graph(trajectories, requests, sampling, max_batch_size)
 
         profile = self._start_continuous_profile() if self.enable_profiling else None
@@ -1352,8 +1363,6 @@ class HybridEngineRollout(RolloutEngine):
         if getattr(module.config, "_attn_implementation", None) == "flash_attention_2":
             raise ValueError("continuous graph capture does not support flash_attention_2")
         device = requests[0].prompt_ids.device
-        if get_accelerator().create_graph() is None:
-            raise ValueError("continuous graph capture is not supported on the current accelerator")
 
         from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache

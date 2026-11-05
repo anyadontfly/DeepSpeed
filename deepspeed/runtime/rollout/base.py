@@ -81,9 +81,6 @@ class RolloutRecord:
     loss_mask: list[int] | None = None
     rollout_log_probs: list[float] | None = None
     status: Status = Status.PENDING
-    # for OPSD
-    teacher_log_probs: list[float] | None = None
-    opd_reverse_kl: list[float] | None = None
 
 
 @dataclass
