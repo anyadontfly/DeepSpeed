@@ -162,6 +162,8 @@ class HybridEngineRolloutConfig:
     # Multi-turn continuous batching: decode steps between host checks for finished turns. A turn that ends
     # in between idles in its row until the check.
     continuous_poll_steps: int = 16
+    # Experiment: rows without a turn read one cached slot instead of their last turn's whole context.
+    continuous_idle_row_reset: bool = False
     max_turns: Optional[int] = None
     # Most prompt + response tokens a multi-turn trajectory may hold; None means no cap.
     max_context_len: Optional[int] = None
@@ -214,6 +216,7 @@ class HybridEngineRollout(RolloutEngine):
         self.enable_cache_trimming = getattr(cfg, 'enable_cache_trimming', False) if cfg else False
         self.continuous_cache_capacity = getattr(cfg, 'continuous_cache_capacity', None) if cfg else None
         self.continuous_poll_steps = getattr(cfg, 'continuous_poll_steps', 16) if cfg else 16
+        self.continuous_idle_row_reset = getattr(cfg, 'continuous_idle_row_reset', False) if cfg else False
         self.multi_turn = getattr(cfg, 'multi_turn', False) if cfg else False
         self.max_turns = getattr(cfg, 'max_turns', None) if cfg else None
         self.max_context_len = getattr(cfg, 'max_context_len', None) if cfg else None
@@ -809,6 +812,10 @@ class HybridEngineRollout(RolloutEngine):
                 i = row_owner[row]
                 row_owner[row] = None
                 finish_turn(i, row_tokens[:count], row_log_probs[:count])
+            if self.continuous_idle_row_reset:
+                write_pos[finished_rows] = 0
+                static_attn[finished_rows] = False
+                static_attn[finished_rows, 0, 0, 0] = True
 
         def collect_tool_results():
             for i in [i for i, entry in tools_in_flight.items() if entry[3].done()]:

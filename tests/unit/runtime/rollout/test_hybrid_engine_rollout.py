@@ -1896,22 +1896,36 @@ def _check_as_if_alone(model, prompts, samples, n_samples_per_prompt, eos, tool_
                 assert step[token] >= step.max() - atol
 
 
-@pytest.mark.parametrize("model_name, dtype, use_segki, use_graph_capture, temperature", [
-    ("qwen3_5", torch.float32, False, True, 0.0),
-    ("qwen3_5", torch.float32, False, False, 0.0),
-    ("qwen3_5", torch.bfloat16, True, True, 0.8),
-    ("llama", None, False, True, 0.0),
-])
+@pytest.mark.parametrize(
+    "model_name, dtype, use_segki, use_graph_capture, temperature, idle_row_reset",
+    [
+        ("qwen3_5", torch.float32, False, True, 0.0, False),
+        ("qwen3_5", torch.float32, False, False, 0.0, False),
+        ("qwen3_5", torch.bfloat16, True, True, 0.8, False),
+        ("llama", None, False, True, 0.0, False),
+        # Real training samples through reset rows, which are then reused by later turns.
+        ("qwen3_5", torch.bfloat16, True, True, 1.0, True),
+        ("qwen3_5", torch.float32, False, True, 1.0, True),
+    ])
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=_TOOL_TOKENS)
 def test_multi_turn_continuous_batching_generates_each_turn_as_if_alone(_tokenize_tool_responses, model_name, dtype,
-                                                                        use_segki, use_graph_capture, temperature):
+                                                                        use_segki, use_graph_capture, temperature,
+                                                                        idle_row_reset):
     """With fewer decode rows than trajectories, every turn waits for a row, is prefilled with its whole
     conversation, and must decode exactly as the trajectory would alone."""
     if not torch.cuda.is_available():  #ignore-cuda
         pytest.skip("multi-turn continuous batching runs on CUDA")
     model_factory = _tiny_qwen3_5 if model_name == "qwen3_5" else _tiny_llama
     model, prompts, eos, tool_length = _continuous_case(model_factory, dtype)
-    rollout = _continuous_rollout(model, eos, tool_length, use_graph_capture=use_graph_capture, use_segki=use_segki)
+    rollout = _continuous_rollout(
+        model,
+        eos,
+        tool_length,
+        use_graph_capture=use_graph_capture,
+        use_segki=use_segki,
+        # Checking every step resets rows while others still decode.
+        continuous_poll_steps=1 if idle_row_reset else 16,
+        continuous_idle_row_reset=idle_row_reset)
     sampling = SamplingConfig(max_new_tokens=24,
                               max_new_tokens_per_turn=8,
                               temperature=temperature,
@@ -1962,6 +1976,38 @@ def test_multi_turn_continuous_batching_matches_static_batching(_tokenize_tool_r
         assert actual.loss_mask == expected.loss_mask
         assert actual.status == expected.status
         torch.testing.assert_close(actual.rollout_log_probs, expected.rollout_log_probs, atol=1e-4, rtol=0)
+
+
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.tokenize_tool_responses", return_value=_TOOL_TOKENS)
+def test_multi_turn_continuous_idle_row_reset_keeps_the_trajectories(_tokenize_tool_responses):
+    """Idle rows read one slot instead of their last context; decoding rows must not notice."""
+    if not torch.cuda.is_available():  #ignore-cuda
+        pytest.skip("multi-turn continuous batching runs on CUDA")
+    model, prompts, eos, tool_length = _continuous_case(_tiny_qwen3_5, torch.bfloat16)
+    request = RolloutRequest(samples=[_prompt(prompt) for prompt in prompts])
+    sampling = SamplingConfig(max_new_tokens=24,
+                              max_new_tokens_per_turn=8,
+                              temperature=0,
+                              n_samples_per_prompt=2,
+                              continuous_batch_size=3)
+    runs = []
+    for reset in (False, True):
+        # Turns are shorter than the default 16 steps between checks, so every row would finish in the same check
+        # and no row would ever be reset beside one still decoding.
+        rollout = _continuous_rollout(model,
+                                      eos,
+                                      tool_length,
+                                      use_graph_capture=True,
+                                      use_segki=True,
+                                      enable_profiling=True,
+                                      continuous_poll_steps=1,
+                                      continuous_idle_row_reset=reset)
+        runs.append(rollout.generate(request, sampling).samples)
+    trace = rollout.get_last_profile()["continuous_poll_trace"]
+    assert any(0 < decoding < held for _, _, held, decoding, *_ in trace)
+    for expected, actual in zip(*runs):
+        assert actual.tokens == expected.tokens
+        assert actual.status == expected.status
 
 
 def test_multi_turn_continuous_batching_needs_a_row_capacity():
