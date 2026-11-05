@@ -33,7 +33,6 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         self._name = 'cuda'
         self._communication_backend_name = 'nccl' if sys.platform != 'win32' else 'gloo'
         self._compile_backend = "inductor"
-        self._nvtx_domains = {}
         if pynvml is None:
             self._init_pynvml()
 
@@ -190,21 +189,6 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         else:
             return torch_gpu_id
 
-    def can_graph_capture_comm(self) -> bool:
-        """NCCL >= 2.14 supports CUDA graph capture of collectives."""
-        try:
-            import torch.distributed as dist
-            if not dist.is_nccl_available():
-                return False
-            # torch exposes NCCL version as (major, minor) tuple
-            nccl_ver = torch.cuda.nccl.version()
-            return nccl_ver[0] > 2 or (nccl_ver[0] == 2 and nccl_ver[1] >= 14)
-        except Exception:
-            return False
-
-    def is_stream_capturing(self):
-        return torch.cuda.is_current_stream_capturing()
-
     def available_memory(self, device_index=None):
         if pynvml:
             if device_index is None:
@@ -248,16 +232,15 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
         return torch.cuda.is_available()
 
     def _get_nvtx_domain(self, domain):
+        # Return the domain name rather than a Domain object for compatibility with older nvtx versions.
         if nvtx is None or domain is None:
             return None
-        if domain not in self._nvtx_domains:
-            self._nvtx_domains[domain] = nvtx.get_domain(domain)
-        return self._nvtx_domains[domain]
+        return domain
 
     def range_push(self, msg, domain=None, category=None):
         nvtx_domain = self._get_nvtx_domain(domain)
         if nvtx_domain is not None:
-            return nvtx_domain.push_range(message=msg, category=category)
+            return nvtx.push_range(message=msg, domain=nvtx_domain, category=category)
         torch_nvtx = getattr(torch.cuda, 'nvtx', None)
         if torch_nvtx is not None and hasattr(torch_nvtx, 'range_push'):
             return torch_nvtx.range_push(msg)
@@ -265,7 +248,7 @@ class CUDA_Accelerator(DeepSpeedAccelerator):
     def range_pop(self, domain=None):
         nvtx_domain = self._get_nvtx_domain(domain)
         if nvtx_domain is not None:
-            return nvtx_domain.pop_range()
+            return nvtx.pop_range(domain=nvtx_domain)
         torch_nvtx = getattr(torch.cuda, 'nvtx', None)
         if torch_nvtx is not None and hasattr(torch_nvtx, 'range_pop'):
             return torch_nvtx.range_pop()

@@ -171,6 +171,20 @@ def test_continuous_graph_rejects_flash_attention():
         rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1))
 
 
+@patch("deepspeed.runtime.rollout.hybrid_engine_rollout.get_accelerator")
+def test_continuous_graph_rejects_unsupported_accelerator(mock_get_accelerator):
+    # Backends without graph capture return None from create_graph(); the
+    # continuous path requires real replay semantics and must refuse to run.
+    mock_get_accelerator.return_value.create_graph.return_value = None
+    engine = _make_engine_on_cpu()
+    engine.module.config = SimpleNamespace()
+    rollout = HybridEngineRollout(engine, _make_tokenizer(), cfg=HybridEngineRolloutConfig(use_graph_capture=True))
+    request = RolloutRequest(samples=[RolloutRecord(tokens=[0, 1, 2], attention_mask=[0, 1, 1])])
+
+    with pytest.raises(ValueError, match="not supported on the current accelerator"):
+        rollout.generate(request, SamplingConfig(max_new_tokens=2, temperature=0, continuous_batch_size=1))
+
+
 def test_continuous_generation_routes_graph_capture_to_fixed_capacity_path():
     rollout = HybridEngineRollout(
         _make_engine_on_cpu(),
@@ -274,8 +288,8 @@ def test_continuous_graph_capture_preserves_attention_implementation(mock_get_ac
 
 def test_continuous_graph_keeps_cache_position_alive_for_replay():
     accelerator = get_accelerator()
-    if accelerator.device_name() != "cuda" or not accelerator.is_available():
-        pytest.skip("requires CUDA graph capture")
+    if not accelerator.is_available() or accelerator.create_graph() is None:
+        pytest.skip("requires graph capture")
 
     class DecodeModule(torch.nn.Module):
 
@@ -1156,7 +1170,7 @@ def test_shared_prefill_rejects_graph_capture():
     config = HybridEngineRolloutConfig(use_graph_capture=True, use_shared_prefill=True)
     rollout = HybridEngineRollout(engine, _make_tokenizer(), config)
 
-    with pytest.raises(RuntimeError, match="does not support CUDA graph capture"):
+    with pytest.raises(RuntimeError, match="does not support graph capture"):
         rollout.generate(_make_request(), _make_sampling(n_samples_per_prompt=2))
 
 

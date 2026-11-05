@@ -141,13 +141,15 @@ class DualWeightGluGEMV(torch.autograd.Function):
         ctx.save_for_backward(hidden, gate_w, up_w)
         if _native_kernel_ready(kernel_op, hidden, gate_w, up_w):
             if hidden.dim() == 1:
-                out = torch.empty(gate_w.shape[0], dtype=hidden.dtype, device=hidden.device)
-                kernel_op.dual_gemv_silu_mul(hidden, gate_w, up_w, out)
-                return out
-            if hidden.dim() == 2 and 1 < hidden.shape[0] <= 32:
-                return kernel_op.dual_gemm_silu_mul(hidden, gate_w, up_w)
-        from deepspeed.module_inject.kernel_reference import dual_gemv_silu_mul
-        return dual_gemv_silu_mul(hidden, gate_w, up_w)
+                # grouped_linear's flat path dispatches M=1 to the GEMV
+                # kernels internally
+                return kernel_op.grouped_linear(hidden, [gate_w, up_w], True)[0]
+            if hidden.dim() == 2:
+                # Route through grouped_linear: the backend dispatcher owns
+                # the WMMA-vs-composite crossover (arch-adaptive since loop 2)
+                return kernel_op.grouped_linear(hidden, [gate_w, up_w], True)[0]
+        from deepspeed.module_inject.kernel_reference import grouped_linear
+        return grouped_linear(hidden, [gate_w, up_w], True)[0]
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -176,7 +178,7 @@ class DualWeightGluGEMV(torch.autograd.Function):
 class GDNInputProj(torch.autograd.Function):
     """GDN input projections (qkv|z|b|a) reading the four original weights.
 
-    Forward (b=1): quad_gemv kernel — one warp per output row across all
+    Forward (b=1): flat GEMV path (dispatched by grouped_linear); b>1
     four weight matrices, no concatenation.
     Forward (b>1): four GEMMs concatenated on the fly.
     Backward: standard PyTorch ops — gradients flow to the original
@@ -188,27 +190,35 @@ class GDNInputProj(torch.autograd.Function):
         ctx.save_for_backward(hidden, w_qkv, w_z, w_b, w_a)
         if _native_kernel_ready(kernel_op, hidden, w_qkv, w_z, w_b, w_a):
             if hidden.dim() == 1:
-                total = w_qkv.shape[0] + w_z.shape[0] + w_b.shape[0] + w_a.shape[0]
-                out = torch.empty(total, dtype=hidden.dtype, device=hidden.device)
-                kernel_op.quad_gemv(hidden, w_qkv, w_z, w_b, w_a, out)
-                return out
-            if hidden.dim() == 3 and hidden.shape[1] == 1 and 1 < hidden.shape[0] <= 32:
+                return kernel_op.grouped_linear(hidden, [w_qkv, w_z, w_b, w_a], False)[0]
+            if hidden.dim() == 3 and hidden.shape[1] == 1:
                 # decode activations arrive [B,1,H]; flatten for the grouped kernel
-                out = kernel_op.quad_gemm(hidden.reshape(hidden.shape[0], -1), w_qkv, w_z, w_b, w_a)
+                x2 = hidden.reshape(hidden.shape[0], -1)
+                out = kernel_op.grouped_linear(x2, [w_qkv, w_z, w_b, w_a], False)[0]
                 return out.view(hidden.shape[0], 1, -1)
-            if hidden.dim() == 2 and 1 < hidden.shape[0] <= 32:
-                return kernel_op.quad_gemm(hidden, w_qkv, w_z, w_b, w_a)
-        from deepspeed.module_inject.kernel_reference import gdn_input_proj
-        return gdn_input_proj(hidden, w_qkv, w_z, w_b, w_a)
+            if hidden.dim() == 2:
+                return kernel_op.grouped_linear(hidden, [w_qkv, w_z, w_b, w_a], False)[0]
+        from deepspeed.module_inject.kernel_reference import grouped_linear
+        parts = grouped_linear(hidden, [w_qkv, w_z, w_b, w_a], False)
+        return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
 
     @classmethod
     def apply6(cls, x, q_w, k_w, v_w, z_w, b_w, a_w, kernel_op):
         """TP block-sliced GDN in_proj through the same grouped_linear
-        interface as the fused 4-mat form (path consistency TP=1/TP=2)."""
-        if _native_kernel_ready(kernel_op, x, q_w, k_w, v_w, z_w, b_w, a_w):
+        interface as the fused 4-mat form (path consistency TP=1/TP=2).
+        Callers that pre-concatenated pass the same tensor for q/k/v and
+        for z/b/a: identical weights collapse to a 2-mat group."""
+        if q_w is k_w and k_w is v_w and z_w is b_w and b_w is a_w:
+            ws = [q_w, z_w]
+        else:
+            ws = [q_w, k_w, v_w, z_w, b_w, a_w]
+        if _native_kernel_ready(kernel_op, x, *ws):
             if hasattr(kernel_op, "grouped_linear"):
-                return kernel_op.grouped_linear(x, [q_w, k_w, v_w, z_w, b_w, a_w], False)[0]
-        return torch.cat([torch.nn.functional.linear(x, w) for w in (q_w, k_w, v_w, z_w, b_w, a_w)], dim=-1)
+                out = kernel_op.grouped_linear(x, ws, False)
+                if len(out) == 2:
+                    return torch.cat(out, -1)
+                return out[0]
+        return torch.cat([torch.nn.functional.linear(x, w) for w in ws], dim=-1)
 
     @staticmethod
     def backward(ctx, grad_out):
@@ -254,8 +264,9 @@ def _dual_weight_glu_forward(self, input):
         return self.down_proj(out.reshape(*input.shape[:-1], -1))
     # other batches or no kernel: the composite reference (gradients also
     # correct there); measured faster than the batched GEMV kernels
-    from deepspeed.module_inject.kernel_reference import dual_gemv_silu_mul
-    return self.down_proj(dual_gemv_silu_mul(input, self.gate_proj.weight, self.up_proj.weight))
+    from deepspeed.module_inject.kernel_reference import grouped_linear
+    glu = grouped_linear(input, [self.gate_proj.weight, self.up_proj.weight], True)[0]
+    return self.down_proj(glu)
 
 
 @dataclass
@@ -306,14 +317,14 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
     # is the layer's only collective.
     import deepspeed.comm as dist
     tp_size = dist.get_world_size() if dist.is_initialized() else 1
-    r = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    r = dist.get_rank() if dist.is_initialized() else 0
     key_dim = self.key_dim // tp_size
     value_dim = self.value_dim // tp_size
     num_v_heads = self.num_v_heads // tp_size
     num_k_heads = self.num_k_heads // tp_size
 
     # Fused [qkv | z | b | a] projection reading the original weights (b=1
-    # quad_gemv kernel, b>1 on-the-fly concat) — no weight copies.
+    # flat GEMV path, b>1 on-the-fly concat) — no weight copies.
     gdn_kernel_op = getattr(self, "_ki_gdn_op", None)
     if tp_size > 1:
         # The fused [q|k|v] weight cannot be column-sharded head-aligned
@@ -328,10 +339,17 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
         k_w = qkv_w[self.key_dim + r * nq:self.key_dim + (r + 1) * nq]
         v_w = qkv_w[2 * self.key_dim + r * nv:2 * self.key_dim + (r + 1) * nv]
         x2 = hidden_states.reshape(-1, hidden_states.shape[-1])
-        # Same dispatch path as TP=1 (GDNInputProj -> grouped_linear); the
-        # backend routes the block-sliced 6-mat form — no raw aten here.
-        fused = GDNInputProj.apply6(x2, q_w, k_w, v_w, self.in_proj_z.weight, self.in_proj_b.weight,
-                                    self.in_proj_a.weight, gdn_kernel_op).view(batch_size, seq_len, -1)
+        # Cache the per-rank concatenated weights (static during rollout):
+        # one wide GEMM per group lets the backend's cuBLAS tile better
+        # than six skinny row-slice GEMMs. Still routed through
+        # grouped_linear — the backend owns the kernel choice.
+        cw = getattr(self, "_ki_tp_cat_w", None)
+        if cw is None or cw[0] is not self.in_proj_qkv.weight:
+            zba_w = torch.cat([self.in_proj_z.weight, self.in_proj_b.weight, self.in_proj_a.weight])
+            cw = (self.in_proj_qkv.weight, torch.cat([q_w, k_w, v_w]), zba_w)
+            self._ki_tp_cat_w = cw
+        fused = GDNInputProj.apply6(x2, cw[1], cw[1], cw[1], cw[2], cw[2], cw[2],
+                                    gdn_kernel_op).view(batch_size, seq_len, -1)
     elif batch_size == 1 and seq_len == 1:
         fused = GDNInputProj.apply(
             hidden_states.squeeze(0).squeeze(0), self.in_proj_qkv.weight, self.in_proj_z.weight, self.in_proj_b.weight,
@@ -381,13 +399,19 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
     # composite path rather than raise inside the binding.
     if (gdn_op is not None and get_accelerator().on_accelerator(a) and not torch.is_grad_enabled()
             and a.dtype is torch.bfloat16):
+        # A_log/dt_bias are static across the rollout — cache the fp32
+        # rank slice once instead of re-casting every decode step
         hv = self.num_v_heads
-        a_log_f = self.A_log.detach().reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads].float().contiguous() \
-            if hv > num_v_heads else self.A_log.detach().float().contiguous()
-        dt_f = self.dt_bias.detach().reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads].float().contiguous() \
-            if hv > num_v_heads else self.dt_bias.detach().float().contiguous()
+        cached = getattr(self, "_ki_gates_cache", None)
+        if cached is None or cached[0] is not self.A_log:
+            sl = (lambda t: t.detach().reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads]) if hv > num_v_heads \
+                else (lambda t: t.detach())
+            cached = (self.A_log, sl(self.A_log).float().contiguous(), sl(self.dt_bias).float().contiguous())
+            self._ki_gates_cache = cached
+        a_log_f, dt_f = cached[1], cached[2]
         # gdn_gates accepts row-strided a/b, so the fused-output slices go in
-        # without contiguous copies.
+        # without contiguous copies. Routed through the torch.library op so
+        # inductor fuses the glue around it (route A).
         beta, g = gdn_op.gdn_gates(a, b, a_log_f, dt_f)
     else:
         beta = b.sigmoid()
@@ -396,8 +420,13 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
         dt_l = self.dt_bias.reshape(-1)[r * num_v_heads:(r + 1) * num_v_heads] if hv > num_v_heads else self.dt_bias
         g = -a_log_l.float().exp() * F.softplus(a.float() + dt_l)
     if num_v_heads // num_k_heads > 1:
-        query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
-        key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+        rep_op = getattr(self, "_ki_gdn_op", None)
+        if (rep_op is not None and hasattr(rep_op, "repeat_qk") and not torch.is_grad_enabled()
+                and query.dtype is torch.bfloat16 and query.is_contiguous() and key.is_contiguous()):
+            query, key = rep_op.repeat_qk(query, key, num_v_heads // num_k_heads)
+        else:
+            query = query.repeat_interleave(num_v_heads // num_k_heads, dim=2)
+            key = key.repeat_interleave(num_v_heads // num_k_heads, dim=2)
 
     recurrent_state = cache_params.layers[self.layer_idx].recurrent_states[0] if use_precomputed_states else None
     # Whitelist the scan inputs: transformers threads unrelated layer kwargs
@@ -432,6 +461,69 @@ def _fused_gdn_forward(self, hidden_states, *args, **kwargs):
     return self.out_proj(core_attn_out)
 
 
+def _fla_recurrent_inplace(query, key, value, **kw):
+    """FLA's fused recurrent with the final state written in place.
+
+    Mirrors fla.ops.gated_delta_rule.fused_recurrent's forward wrapper —
+    same grid, metaparams, and kernel — except ht is the caller's cache
+    slot (== h0) instead of a fresh allocation. Assumes the decode shape
+    (T==1, no cu_seqlens, gating precomputed) of the scan call site.
+    """
+    import triton
+    from fla.ops.gated_delta_rule.fused_recurrent import fused_recurrent_gated_delta_rule_fwd_kernel
+
+    # The kernel indexes packed memory; FLA's wrapper guarantees this through input_guard, skipped here.
+    q, k, v = query.contiguous(), key.contiguous(), value.contiguous()
+    g = kw.get("g")
+    g = g.contiguous() if g is not None else None
+    beta = kw.get("beta")
+    beta = beta.contiguous() if beta is not None else None
+    slot = kw["initial_state"]
+    B, T, H, K = k.shape
+    V = v.shape[-1]
+    HV = v.shape[2]
+    o = torch.empty_like(v)
+    BK = triton.next_power_of_2(K)
+    # the outer (bypassed) wrapper computes this default; the Triton
+    # kernel cannot branch on a None host value
+    scale = kw.get("scale")
+    if scale is None: scale = K**-0.5
+    BV = min(8, triton.next_power_of_2(V))
+    NV = triton.cdiv(V, BV)
+    # The kernel reads program_id(0) as the value block and program_id(1) as row * head.
+    fused_recurrent_gated_delta_rule_fwd_kernel[(NV, B * HV)](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        gk=None,
+        gv=None,
+        beta=beta,
+        A_log=None,
+        dt_bias=None,
+        o=o,
+        h0=slot,
+        ht=slot,  # in-place: each program reads its tile before writing it
+        cu_seqlens=None,
+        scale=scale,
+        T=T,
+        H=H,
+        HV=HV,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        IS_BETA_HEADWISE=beta.ndim != v.ndim,
+        USE_QK_L2NORM_IN_KERNEL=kw.get("use_qk_l2norm_in_kernel", False),
+        APPLY_BETA_SIGMOID=False,
+        ALLOW_NEG_EIGVAL=kw.get("allow_neg_eigval", False),
+        STATE_V_FIRST=False,
+        num_warps=1,
+        num_stages=3,
+    )
+    return o, None  # None: the state is already in the cache slot
+
+
 def _install_gdn_segment(seg: GDNSegment) -> bool:
     """Wire the fused forward onto a GDN block, binding its original helpers.
 
@@ -455,7 +547,7 @@ def _install_gdn_segment(seg: GDNSegment) -> bool:
         tp_sz = dist.get_world_size() if dist.is_initialized() else 1
         if tp_sz == 1:
             return parent.conv1d.weight.squeeze(1), parent.conv1d.bias
-        rk = torch.distributed.get_rank()
+        rk = dist.get_rank()
         nq = parent.key_dim // tp_sz
         nv = parent.value_dim // tp_sz
         w = parent.conv1d.weight.squeeze(1)
@@ -493,6 +585,11 @@ def _install_gdn_segment(seg: GDNSegment) -> bool:
         # kernel updates the cache buffer directly — no FLA output tensor,
         # no HF copy-back, half the state traffic
         step_op = getattr(parent, "_ki_gdn_op", None)
+        # TP block-sliced q/k/v arrive as strided views; the in-place
+        # kernel loses to FLA at TP head counts even after the occupancy
+        # retune (smem staging removed: 998/2650/4161 vs 1001/2856/4238)
+        # — keep the strided-view rejection so TP decodes route to FLA;
+        # the re-tuned kernel still serves the TP=1 path where it wins
         if (init_state is not None and query.shape[1] == 1 and step_op is not None
                 and hasattr(step_op, "gdn_recurrent_step") and not torch.is_grad_enabled()
                 and query.shape[0] >= 16  # below that our block count starves vs FLA's tiling
@@ -511,6 +608,21 @@ def _install_gdn_segment(seg: GDNSegment) -> bool:
         # (5.19+) no longer bind them per-layer; fall back to the module-level
         # torch_* implementations there.
         single = kw.get("initial_state") is not None and query.shape[1] == 1
+        import os as _os
+        _dbg = _os.environ.get("FLA_BYPASS", "1") == "1"
+        if single and not torch.is_grad_enabled() and _dbg:
+            # FLA's wrapper allocates a fresh final_state and the caller
+            # copies it back into the graph-static cache slot (~35us x 24
+            # layers/step). Call the Triton kernel directly with the cache
+            # slot as BOTH h0 and ht — each program reads its state tile
+            # before writing it, so in-place is safe — keeping FLA's math
+            # and dropping the round trip. The caller sees None and skips
+            # its copy (the state is already home).
+            try:
+                out = _fla_recurrent_inplace(query, key, value, **kw)
+                return out
+            except (ImportError, AttributeError):
+                pass  # FLA layout changed — fall through to the wrapper
         fn_name = "recurrent_gated_delta_rule" if single else "chunk_gated_delta_rule"
         fn = getattr(parent, fn_name, None)
         if fn is None:
@@ -524,11 +636,42 @@ def _install_gdn_segment(seg: GDNSegment) -> bool:
     parent._ki_gdn_conv_update = conv_update_with_weights
     parent._ki_gdn_conv_fn = conv_fn_with_weights
     parent._ki_gdn_scan = scan
-    parent.forward = _fused_gdn_forward.__get__(parent, type(parent))
+    fwd = _fused_gdn_forward.__get__(parent, type(parent))
+
+    parent.forward = fwd
     return True
 
 
 _NATIVE_OP_LOAD_WHY = None
+
+
+def segki_refresh(model: torch.nn.Module) -> None:
+    """Drop every derived-weight cache after an in-place weight write.
+
+    The injected forwards cache tensors derived from the weights (concat
+    groups, sliced conv weights, fp32 gate constants) keyed by weight
+    identity/pointer. An arena or reshard sync that updates weights in
+    place keeps those keys valid while the VALUES change, so the caches
+    would serve stale copies mixed with fresh direct reads. Call this
+    after every in-place weight update; a fresh injection rebuilds the
+    same state automatically.
+
+    NOTE: this explicit-call contract is PROVISIONAL — the final
+    weight-sync handshake (automatic detection vs explicit call vs a
+    redesigned cache scheme) is still under design; expect this entry
+    point to change.
+    """
+    op = None
+    for module in model.modules():
+        for attr in ("_ki_tp_cat_w", "_ki_attn_cat_w", "_ki_conv_w_local", "_ki_gates_cache"):
+            if hasattr(module, attr):
+                delattr(module, attr)
+                op = op if op is not None else getattr(module, "_ki_gdn_op", None)
+    # the GLU concat cache is process-wide in the backend
+    gdn_op = op or next(
+        (getattr(m, "_ki_gdn_op", None) for m in model.modules() if getattr(m, "_ki_gdn_op", None) is not None), None)
+    if gdn_op is not None and hasattr(gdn_op, "clear_glu_cat_cache"):
+        gdn_op.clear_glu_cat_cache()
 
 
 def _load_native_op():
@@ -580,7 +723,7 @@ def apply_segment_ki(model: torch.nn.Module) -> dict:
     replaced = 0
     for seg in segments:
         seg.parent._ki_dual_op = kernel_op if kernel_op is not None and hasattr(kernel_op,
-                                                                                "dual_gemv_silu_mul") else None
+                                                                                "grouped_linear") else None
         seg.parent.forward = _dual_weight_glu_forward.__get__(seg.parent, type(seg.parent))
         replaced += 1
     report["fused_glu"] = {"segments_found": len(segments), "segments_replaced": replaced}
@@ -627,7 +770,7 @@ def _decode_attn_forward(self,
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
-    # b=1: triple_gemv single-vector kernel; 1 < b <= 32: triple_gemm
+    # b=1: flat GEMV; 1 < b <= 32: grouped WMMA (both via grouped_linear)
     # grouped kernel (same weights, one launch); larger batches use the
     # projections as-is.
     batch = hidden_states.shape[0]
@@ -635,21 +778,35 @@ def _decode_attn_forward(self,
     # every branch yields the raw (pre-norm, pre-rope) flat K/V so the
     # fused-K path can hand them to the kernel
     if qkv_op is not None and hasattr(qkv_op, "grouped_linear"):
-        # single dispatcher entry; the backend routes by batch internally
-        q_out, k_flat, v_flat = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]),
-                                                      [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight],
-                                                      False)
-        query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
+        # single dispatcher entry; the backend routes by batch internally.
+        # The projections are static across the rollout — cache the
+        # concatenated weight so one wide GEMM replaces three skinny ones.
+        cw = getattr(self, "_ki_attn_cat_w", None)
+        if cw is None or cw[0] is not self.q_proj.weight:
+            cw = (self.q_proj.weight, torch.cat([self.q_proj.weight, self.k_proj.weight, self.v_proj.weight]))
+            self._ki_attn_cat_w = cw
+        fused = qkv_op.grouped_linear(hidden_states.reshape(-1, hidden_states.shape[-1]), [cw[1]], False)[0]
+        if fused.dim() == 1:
+            fused = fused.view(1, -1)  # flat GEMV path returns [N] for M=1
+        qn, kn = self.q_proj.weight.shape[0], self.k_proj.weight.shape[0]
+        # decode_attn needs contiguous k/v; the tiny materialization (B*k_dims
+        # bf16) is far cheaper than the two extra GEMM launches it replaces
+        # The kernel steps rows by heads * head stride, so q_out must not keep the row stride of the wider fused output
+        q_out = fused[:, :qn].contiguous()
+        k_flat = fused[:, qn:qn + kn].contiguous()
+        v_flat = fused[:, qn + kn:].contiguous()
+        query_states, gate = torch.chunk(q_out.reshape(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
     elif qkv_op is not None and batch == 1:
         # One GEMV launch over q/k/v weights directly — replaces the
         # three separate F.linear launches. q_proj keeps its 2x-wide
         # query|gate layout, so the gate split below is unchanged from HF.
-        q_out, k_flat, v_flat = qkv_op.triple_gemv(hidden_states.view(-1), self.q_proj.weight, self.k_proj.weight,
-                                                   self.v_proj.weight)
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(
+            hidden_states.view(-1), [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], False)
         query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
     elif qkv_op is not None:
-        q_out, k_flat, v_flat = qkv_op.triple_gemm(hidden_states.reshape(-1, hidden_states.shape[-1]),
-                                                   self.q_proj.weight, self.k_proj.weight, self.v_proj.weight)
+        q_out, k_flat, v_flat = qkv_op.grouped_linear(
+            hidden_states.reshape(-1, hidden_states.shape[-1]),
+            [self.q_proj.weight, self.k_proj.weight, self.v_proj.weight], False)
         query_states, gate = torch.chunk(q_out.view(*input_shape, -1, self.head_dim * 2), 2, dim=-1)
     else:
         query_states, gate = torch.chunk(self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2),
@@ -707,8 +864,6 @@ def _decode_attn_forward(self,
             eps=self.q_norm.eps,
             rope_dim=self._ki_cos_t.shape[-1])
     else:
-        # NOTE: this branch (no RoPE tables) skips q_norm, the q-side RoPE and
-        # the output gate, so it does not match the HF forward either.
         self._ki_attn_op.decode_attn(query_states.reshape(batch, num_q_heads, head_dim), key_states, value_states,
                                      self._ki_write_pos, out, num_q_heads, num_kv_heads, head_dim, key_states.shape[2])
 
@@ -726,7 +881,7 @@ def install_lm_head(model: torch.nn.Module, kernel_op) -> int:
     lm = getattr(model, "lm_head", None)
     if lm is None or not hasattr(lm, "weight"):
         return 0
-    if kernel_op is None or not hasattr(kernel_op, "single_gemm"):
+    if kernel_op is None or not hasattr(kernel_op, "grouped_linear"):
         return 0
     if lm.weight.dtype is not torch.bfloat16 or lm.bias is not None:
         return 0
@@ -737,10 +892,27 @@ def install_lm_head(model: torch.nn.Module, kernel_op) -> int:
 
     def _lm_forward(self, hidden_states):
         b = hidden_states.shape[0]
-        if (not torch.is_grad_enabled() and hidden_states.dim() == 3 and hidden_states.shape[1] == 1 and 16 <= b <= 32
-                and hidden_states.is_contiguous()):
-            out = self._ki_gemm_op.single_gemm(hidden_states.reshape(b, -1), self.weight)
-            return out.view(b, 1, -1)
+        if hidden_states.dim() == 3 and hidden_states.shape[1] == 1:
+            # Vocab-parallel decode: each rank GEMMs its contiguous half of
+            # the (replicated) weight — half the weight traffic — and the
+            # rank-ordered all-gather reassembles full logits for argmax
+            # and sampling alike; downstream sees identical semantics.
+            import deepspeed.comm as dist
+            tp = dist.get_world_size() if dist.is_initialized() else 1
+            x2 = hidden_states.reshape(b, -1)
+            if tp > 1 and self.weight.shape[0] % tp == 0:
+                half = self.weight.shape[0] // tp
+                w_loc = self.weight[dist.get_rank() * half:(dist.get_rank() + 1) * half]
+                if not torch.is_grad_enabled() and 16 <= b <= 32 and x2.is_contiguous():
+                    loc = self._ki_gemm_op.grouped_linear(x2, [w_loc], False)[0]
+                else:
+                    loc = torch.nn.functional.linear(x2, w_loc)
+                parts = [torch.empty_like(loc) for _ in range(tp)]
+                dist.all_gather(parts, loc.contiguous())
+                return torch.cat(parts, dim=-1).view(b, 1, -1)
+            if (not torch.is_grad_enabled() and 16 <= b <= 32 and hidden_states.is_contiguous()):
+                out = self._ki_gemm_op.grouped_linear(x2, [self.weight], False)[0]
+                return out.view(b, 1, -1)
         return torch.nn.functional.linear(hidden_states, self.weight, self.bias)
 
     lm._ki_gemm_op = kernel_op
@@ -806,7 +978,7 @@ def install_decode_attention(model: torch.nn.Module,
         module._ki_attn_op = kernel_op
         # The fused QKV kernel consumes weights only; biased projections would lose their bias.
         unbiased_qkv = all(p.bias is None for p in projections[:3])
-        module._ki_qkv_op = kernel_op if (hasattr(kernel_op, "triple_gemv") and unbiased_qkv) else None
+        module._ki_qkv_op = kernel_op if (hasattr(kernel_op, "grouped_linear") and unbiased_qkv) else None
         module._ki_write_pos = write_pos
         module._ki_rope = apply_rotary_pos_emb
         module._ki_num_q_heads = num_q_heads
@@ -833,7 +1005,7 @@ def _fused_norm_layer_forward(self,
     pre-attention norm stays native — the HF layer normifies the raw hidden
     state there, with no add to fuse — and the final post-MLP add stays a
     plain add for the same reason. Attention and MLP are called unchanged,
-    so attention-level patches (decode_attn / triple_gemv) still apply."""
+    so attention-level patches (decode_attn / grouped_linear) still apply."""
     if (hidden_states.shape[1] > 1 or hidden_states.dtype is not torch.bfloat16 or not hidden_states.is_contiguous()
             or getattr(self, "_ki_norm_op", None) is None or torch.is_grad_enabled()):
         # Prefill, a non-graph path, or any grad-enabled

@@ -229,6 +229,18 @@ class HybridEngineRollout(RolloutEngine):
         else:
             self._segki_report = None
 
+    def refresh_weights(self) -> None:
+        """Handshake for in-place weight updates (arena / reshard syncs).
+
+        Drops the injected forwards' derived-weight caches; CUDA graphs
+        stay valid (their baked addresses see the new values directly).
+
+        PROVISIONAL contract — see segki_refresh; the final weight-sync
+        handshake is still under design.
+        """
+        from deepspeed.module_inject.segment_ki import segki_refresh
+        segki_refresh(self.engine.module)
+
     def _apply_segki(self):
         """Apply segment-KI kernel injection to the wrapped module.
 
@@ -295,7 +307,7 @@ class HybridEngineRollout(RolloutEngine):
         try:
             if self.use_shared_prefill and n > 1:
                 if self.use_graph_capture:
-                    raise RuntimeError("Shared prefill does not support CUDA graph capture")
+                    raise RuntimeError("Shared prefill does not support graph capture")
                 self.engine.prepare_shared_prefill(len(samples), n, prompt_len)
                 shared_prefill_handles = self._register_shared_prefill_hooks(module, len(samples), n)
             output_ids, log_probs = self._generate_tokens(prompt_ids, prompt_attn, sampling.max_new_tokens, sampling,
@@ -1269,10 +1281,10 @@ class HybridEngineRollout(RolloutEngine):
             raise ValueError("continuous batching requires a model with cache-class support; use the default "
                              "generate() path or upgrade transformers")
         if getattr(module.config, "_attn_implementation", None) == "flash_attention_2":
-            raise ValueError("continuous CUDA graph capture does not support flash_attention_2")
+            raise ValueError("continuous graph capture does not support flash_attention_2")
         device = requests[0].prompt_ids.device
-        if device.type != "cuda":
-            raise ValueError("continuous CUDA graph capture requires CUDA rollout inputs")
+        if get_accelerator().create_graph() is None:
+            raise ValueError("continuous graph capture is not supported on the current accelerator")
 
         from transformers import StaticCache
         from deepspeed.utils.static_cache import DeepSpeedStaticCache
@@ -1454,9 +1466,9 @@ class HybridEngineRollout(RolloutEngine):
 
     def _validate_continuous_graph_options(self, prompt_len, sampling):
         if self.align_decode_fronts:
-            raise ValueError("continuous CUDA graph capture does not support aligned decode fronts")
+            raise ValueError("continuous graph capture does not support aligned decode fronts")
         if self.enable_cache_trimming:
-            raise ValueError("continuous CUDA graph capture does not support cache trimming")
+            raise ValueError("continuous graph capture does not support cache trimming")
         if (self.continuous_cache_capacity is not None
                 and self.continuous_cache_capacity < prompt_len + sampling.max_new_tokens):
             raise ValueError("continuous_cache_capacity must fit the prompt and all generated tokens")

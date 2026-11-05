@@ -225,31 +225,17 @@ class RowParallel(torch.autograd.Function):
         ctx.group = group
         if not pg_utils.is_parallel(group):
             return input
-        if is_inference_mode:
-            RowParallel._rs_ag(input, group)
+        # contiguous() may hand back a copy — the reduction must land in
+        # the caller's tensor, not a discarded temporary
+        red = input.contiguous()
+        # inference_all_reduce picks the fastest backend available (one-shot
+        # custom AR on TP=2 pairs, shm+AVX on CPU) and falls back on its own
+        if is_inference_mode or not torch.is_grad_enabled():
+            dist.inference_all_reduce(red, group=group)
         else:
-            dist.all_reduce(input.contiguous(), group=group)
+            dist.all_reduce(red, group=group)
+        if red is not input: input.copy_(red)
         return input
-
-    @staticmethod
-    def _rs_ag(input: torch.Tensor, group: dist.ProcessGroup) -> None:
-        """Reduce-scatter then all-gather, writing back into ``input``.
-
-        Equivalent to all_reduce in output, but each collective moves
-        N/TP bytes per rank instead of N, opening overlap opportunities."""
-        import torch.distributed as td
-        world = td.get_world_size(group=group)
-        if world <= 1:
-            return
-        flat = input.view(-1)
-        chunk = flat.numel() // world
-        if chunk * world != flat.numel():
-            # not evenly divisible — fall back to plain all-reduce
-            dist.inference_all_reduce(input, group=group)
-            return
-        scattered = torch.empty(chunk, dtype=input.dtype, device=input.device)
-        td.reduce_scatter_tensor(scattered, flat.contiguous(), group=group)
-        td.all_gather_into_tensor(flat, scattered, group=group)
 
     @staticmethod
     def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[None, torch.Tensor, None]:
@@ -1120,6 +1106,16 @@ class VocabParallelLinear(LinearLayer):
         self.vocab_size = self._orig_weight_shape[0]
         self.vocab_start_index = sum(self._partition_sizes[:self.tp_index])
         self.vocab_end_index = self.vocab_start_index + self._partition_sizes[self.tp_index]
+        # Set by the fused linear cross-entropy loss, which defers this projection into the loss.
+        self.fused_loss_capture = None
+
+    def forward(self, input):
+        capture = self.fused_loss_capture
+        if capture is not None and capture.armed:
+            # The fused loss projects ``input`` itself and reduces its gradient over TP, so the
+            # column-parallel input collective must not run here as well.
+            return capture.take(input)
+        return super().forward(input)
 
 
 class VocabParallelEmbedding(TensorParallel_Layer):
@@ -1500,6 +1496,36 @@ class fused_LinearLayer(SubParamColumnParallel):
         self._subparam_layout_spec = (fused_qkv_subparam_sizes(kwargs.get('fused_module'), tuple(module.weight.shape),
                                                                kwargs['tp_meta']), None)
         super().__init__(module, mp_group, skip_partition, **kwargs)
+        self._sum_replicated_kv_gradients()
+
+    def _sum_replicated_kv_gradients(self):
+        """Sum the gradient of the key/value block that GPTBigCode gives every rank whole.
+
+        Each rank attends with only its own query heads, so the gradient it computes for the
+        shared key/value rows covers those heads alone. Unless the ranks add those partial
+        gradients, each applies a different update to rows that must stay identical, and
+        training departs from the unsharded model. The input gradient needs no change: the
+        column-parallel backward already sums every rank's contribution to it.
+        """
+        from deepspeed.module_inject.fusedqkv_utils import get_fused_qkv_type
+
+        if get_fused_qkv_type(self.fused_module.module) != 'bigcodetype' or not pg_utils.is_parallel(self.mp_group):
+            return
+        n_embd = self.tp_meta.n_embd
+        if n_embd is None:
+            return
+        # This rank's shard is its query rows followed by the whole key/value block.
+        kv_start = get_shard_size_list(n_embd, self.tp_world_size, self.tp_meta)[self.tp_index]
+        group = self.mp_group
+
+        def sum_kv_rows(grad):
+            grad = grad.clone()
+            dist.all_reduce(grad.narrow(0, kv_start, grad.shape[0] - kv_start), group=group)
+            return grad
+
+        for param in (self.weight, self.bias):
+            if param is not None and param.requires_grad:
+                param.register_hook(sum_kv_rows)
 
     def _freeze_partition_sizes(self, total_size):
         super()._freeze_partition_sizes(total_size)

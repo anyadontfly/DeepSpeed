@@ -11,11 +11,13 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <cooperative_groups.h>
 #include <cuda_bf16.h>
-#include <mma.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <torch/extension.h>
 #include <algorithm>
+#include <cstdint>
+#include <unordered_map>
 
 #define SILU(x) ((x) / (1.0f + expf(-(x))))
 
@@ -236,7 +238,8 @@ __global__ void dual_gemv_silu_mul_kernel(const __nv_bfloat16* __restrict__ hidd
 void dual_gemv_silu_mul(at::Tensor hidden, at::Tensor gate_w, at::Tensor up_w, at::Tensor out)
 {
     TORCH_CHECK(hidden.size(-1) % 8 == 0, "in_features must be a multiple of 8");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0, "hidden must be 16B aligned");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0,
+                "hidden must be 16B aligned");
     TORCH_CHECK(hidden.is_cuda() && hidden.scalar_type() == at::ScalarType::BFloat16,
                 "hidden must be CUDA bf16");
     TORCH_CHECK(gate_w.is_contiguous() && up_w.is_contiguous(), "weights must be contiguous");
@@ -317,7 +320,8 @@ void quad_gemv(at::Tensor hidden,
         w0.is_contiguous() && w1.is_contiguous() && w2.is_contiguous() && w3.is_contiguous(),
         "weights must be contiguous");
     TORCH_CHECK(w0.size(1) % 8 == 0, "in_features must be a multiple of 8");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0, "hidden must be 16B aligned");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0,
+                "hidden must be 16B aligned");
     int rows0 = (int)w0.size(0), rows1 = (int)w1.size(0);
     int rows2 = (int)w2.size(0), rows3 = (int)w3.size(0);
     int in_f = (int)w0.size(1);
@@ -363,13 +367,13 @@ __global__ void __launch_bounds__(512)
                        int max_len,
                        float scale,
                        int pos_stride,
-                       const float* __restrict__ q_norm_w,      // [HEAD_DIM], pre-scaled (1+w)
-                       const float* __restrict__ cos_t,         // [max_len, rope_dim]
-                       const float* __restrict__ sin_t,         // [max_len, rope_dim]
+                       const float* __restrict__ q_norm_w,       // [HEAD_DIM], pre-scaled (1+w)
+                       const float* __restrict__ cos_t,          // [max_len, rope_dim]
+                       const float* __restrict__ sin_t,          // [max_len, rope_dim]
                        const __nv_bfloat16* __restrict__ gate,   // q layout
-                       const __nv_bfloat16* __restrict__ k_raw,    // this step's K, pre-norm/rope
-                       const __nv_bfloat16* __restrict__ v_raw,    // this step's V
-                       const float* __restrict__ k_norm_w,         // [HEAD_DIM], pre-scaled (1+w)
+                       const __nv_bfloat16* __restrict__ k_raw,  // this step's K, pre-norm/rope
+                       const __nv_bfloat16* __restrict__ v_raw,  // this step's V
+                       const float* __restrict__ k_norm_w,       // [HEAD_DIM], pre-scaled (1+w)
                        float eps,
                        int rope_dim)
 {
@@ -458,8 +462,8 @@ __global__ void __launch_bounds__(512)
         const int kj0 = lane * EPL;
         const int khalf_lanes = rope_dim > 0 ? (rope_dim / 2) / EPL : 0;
         const int kpartner = (kj0 < rope_dim / 2) ? lane + khalf_lanes
-                            : (kj0 < rope_dim)   ? lane - khalf_lanes
-                                                 : lane;
+                             : (kj0 < rope_dim)   ? lane - khalf_lanes
+                                                  : lane;
         float kpair[EPL];
 #pragma unroll
         for (int e = 0; e < EPL; e++) kpair[e] = __shfl_sync(0xffffffff, k_reg[e], kpartner);
@@ -638,8 +642,10 @@ void decode_attn(at::Tensor q,
     auto k_ptr = reinterpret_cast<__nv_bfloat16*>(K.data_ptr<at::BFloat16>());
     auto v_ptr = reinterpret_cast<__nv_bfloat16*>(V.data_ptr<at::BFloat16>());
     auto o_ptr = reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>());
-    auto k_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(k_raw.data_ptr<at::BFloat16>()) : nullptr;
-    auto v_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(v_raw.data_ptr<at::BFloat16>()) : nullptr;
+    auto k_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(k_raw.data_ptr<at::BFloat16>())
+                            : nullptr;
+    auto v_raw_ptr = fuse_k ? reinterpret_cast<const __nv_bfloat16*>(v_raw.data_ptr<at::BFloat16>())
+                            : nullptr;
     auto k_norm_ptr = fuse_k ? k_norm_w.data_ptr<float>() : nullptr;
     auto qn_ptr = fuse_q ? q_norm_w.data_ptr<float>() : nullptr;
     auto cos_ptr = fuse_q ? cos_t.data_ptr<float>() : nullptr;
@@ -903,7 +909,8 @@ std::vector<at::Tensor> triple_gemv(at::Tensor hidden,
     TORCH_CHECK(q_w.size(1) == k_w.size(1) && k_w.size(1) == v_w.size(1),
                 "in_features must match across q/k/v");
     TORCH_CHECK(q_w.size(1) % 8 == 0, "in_features must be a multiple of 8");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0, "hidden must be 16B aligned");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(hidden.data_ptr()) & 15) == 0,
+                "hidden must be 16B aligned");
     int q_out_f = (int)q_w.size(0);
     int kv_out_f = (int)k_w.size(0);
     TORCH_CHECK(v_w.size(0) == kv_out_f, "v/k weight shapes must match");
@@ -930,26 +937,29 @@ std::vector<at::Tensor> triple_gemv(at::Tensor hidden,
     return {q_out, k_out, v_out};
 }
 
-
-
 // Grouped linear for small batches (2..32): one launch covers up to four
 // weight matrices, each weight element streamed exactly once (the
 // activation tile rides in shared memory). Replaces the separate cuBLAS
 // GEMMs the composite fallback issues per matrix; no weight copies.
-static constexpr int GRP_MT = 32;   // max batch rows
-static constexpr int GRP_NT = 64;   // output columns per block (2 WMMA tiles per warp)
-static constexpr int GRP_KT = 128;  // k-chunk staged through smem
-static constexpr int GRP_TPB = 256;      // threads per block (8 warps, one 16x16 tile each)
-static constexpr int GRP_KT_GLU = 64;   // GLU stages gate+up tiles: smaller KT fits 99KB
+static constexpr int GRP_MT = 32;          // max batch rows
+static constexpr int GRP_NT = 64;          // Ada default (2 WMMA tiles per warp)
+static constexpr int GRP_NT_AMPERE = 128;  // A100: more smem (164KB) + bandwidth
+static constexpr int GRP_KT = 128;         // k-chunk staged through smem
+static constexpr int GRP_TPB = 256;        // threads per block (8 warps, one 16x16 tile each)
+static constexpr int GRP_KT_GLU = 64;      // GLU stages gate+up tiles: smaller KT fits 99KB
 
-constexpr int GRP_SMEM_BYTES = (2 * GRP_MT * (GRP_KT + 8) + 2 * GRP_NT * (GRP_KT + 8)) * 2 +
-                               GRP_MT * (GRP_NT + 8) * 4;
-constexpr int GRP_GLU_SMEM_BYTES = (2 * GRP_MT * (GRP_KT_GLU + 8) + 4 * GRP_NT * (GRP_KT_GLU + 8)) * 2 +
-                                   2 * GRP_MT * (GRP_NT + 8) * 4;
+constexpr int GRP_SMEM_BYTES =
+    (2 * GRP_MT * (GRP_KT + 8) + 2 * GRP_NT * (GRP_KT + 8)) * 2 + GRP_MT * (GRP_NT + 8) * 4;
+constexpr int GRP_SMEM_BYTES_AMPERE =
+    (2 * GRP_MT * (GRP_KT + 8) + 2 * GRP_NT_AMPERE * (GRP_KT + 8)) * 2 +
+    GRP_MT * (GRP_NT_AMPERE + 8) * 4;
+constexpr int GRP_GLU_SMEM_BYTES =
+    (2 * GRP_MT * (GRP_KT_GLU + 8) + 4 * GRP_NT * (GRP_KT_GLU + 8)) * 2 +
+    2 * GRP_MT * (GRP_NT + 8) * 4;
 
 struct GrpSeg {
-    int mat;  // which weight matrix
-    int lrow; // row within that matrix
+    int mat;   // which weight matrix
+    int lrow;  // row within that matrix
 };
 
 __device__ __forceinline__ const __nv_bfloat16* wgs_ptr(int mat,
@@ -966,13 +976,17 @@ __device__ __forceinline__ GrpSeg grp_map_row(int row, int f0, int f1, int f2, i
     GrpSeg s{0, row};
     int fs[4] = {f0, f1, f2, f3};
     for (int i = 0; i < n_mat && i < 4; i++) {
-        if (s.lrow < fs[i]) { s.mat = i; return s; }
+        if (s.lrow < fs[i]) {
+            s.mat = i;
+            return s;
+        }
         s.lrow -= fs[i];
     }
     s.mat = 0;  // unreachable for well-formed launches
     return s;
 }
 
+template <int NT_TILE>
 __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
                                       const __nv_bfloat16* __restrict__ w0,
                                       const __nv_bfloat16* __restrict__ w1,
@@ -991,22 +1005,25 @@ __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
                                       int total_out,
                                       int concat_mode)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    // bf16 WMMA needs sm80+; see the note above the kernel
+
     using namespace nvcuda;
     // dynamic smem: xs[2][MT][KT+8] | ws[2][NT][KT+8] | out_s[MT][NT+8]
     extern __shared__ char smem_raw[];
     const int XS_STRIDE = GRP_KT + 8;
     __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* ws = xs + 2 * GRP_MT * XS_STRIDE;
-    float* out_s = reinterpret_cast<float*>(ws + 2 * GRP_NT * XS_STRIDE);
-    __shared__ GrpSeg seg_tab[GRP_NT];
+    float* out_s = reinterpret_cast<float*>(ws + 2 * NT_TILE * XS_STRIDE);
+    __shared__ GrpSeg seg_tab[NT_TILE];
 
     int tid = threadIdx.x;
     int warp = tid >> 5;
     int lane = tid & 31;
-    int n0 = blockIdx.x * GRP_NT;
+    int n0 = blockIdx.x * NT_TILE;
     if (n0 >= total_out) return;
 
-    for (int c = tid; c < GRP_NT; c += GRP_TPB) {
+    for (int c = tid; c < NT_TILE; c += GRP_TPB) {
         seg_tab[c] = (n0 + c < total_out) ? grp_map_row(n0 + c, f0, f1, f2, f3, 4) : GrpSeg{0, 0};
     }
     __syncthreads();
@@ -1026,17 +1043,20 @@ __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
         int kn = min(GRP_KT, K - k0);
         int kn8 = kn >> 3;
         __nv_bfloat16* xbuf = xs + (long)(c & 1) * GRP_MT * XS_STRIDE;
-        __nv_bfloat16* wbuf = ws + (long)(c & 1) * GRP_NT * XS_STRIDE;
+        __nv_bfloat16* wbuf = ws + (long)(c & 1) * NT_TILE * XS_STRIDE;
         for (int idx = tid; idx < M * kn8; idx += GRP_TPB) {
             int m = idx / kn8, j = idx % kn8;
-            __pipeline_memcpy_async(xbuf + (long)m * XS_STRIDE + j * 8, x + (long)m * K + k0 + (long)j * 8, 16);
+            __pipeline_memcpy_async(
+                xbuf + (long)m * XS_STRIDE + j * 8, x + (long)m * K + k0 + (long)j * 8, 16);
         }
-        for (int idx = tid; idx < GRP_NT * kn8; idx += GRP_TPB) {
+        for (int idx = tid; idx < NT_TILE * kn8; idx += GRP_TPB) {
             int r = idx / kn8, j = idx % kn8;
             if (n0 + r < total_out) {
                 GrpSeg g = seg_tab[r];
-                __pipeline_memcpy_async(wbuf + (long)r * XS_STRIDE + j * 8,
-                                        wgs_ptr(g.mat, w0, w1, w2, w3) + (long)g.lrow * K + k0 + (long)j * 8, 16);
+                __pipeline_memcpy_async(
+                    wbuf + (long)r * XS_STRIDE + j * 8,
+                    wgs_ptr(g.mat, w0, w1, w2, w3) + (long)g.lrow * K + k0 + (long)j * 8,
+                    16);
             }
         }
         __pipeline_commit();
@@ -1051,19 +1071,20 @@ __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
         if (kn < GRP_KT) {
             // partial final chunk: zero the tail so wmma sees zeros
             __nv_bfloat16* xbuf = xs + (long)(c & 1) * GRP_MT * XS_STRIDE;
-            __nv_bfloat16* wbuf = ws + (long)(c & 1) * GRP_NT * XS_STRIDE;
+            __nv_bfloat16* wbuf = ws + (long)(c & 1) * NT_TILE * XS_STRIDE;
             for (int idx = tid; idx < GRP_MT * GRP_KT; idx += GRP_TPB) {
                 int r = idx / GRP_KT, cc = idx % GRP_KT;
                 if (cc >= kn && r < M) xbuf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
             }
-            for (int idx = tid; idx < GRP_NT * GRP_KT; idx += GRP_TPB) {
+            for (int idx = tid; idx < NT_TILE * GRP_KT; idx += GRP_TPB) {
                 int r = idx / GRP_KT, cc = idx % GRP_KT;
-                if (cc >= kn && n0 + r < total_out) wbuf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
+                if (cc >= kn && n0 + r < total_out)
+                    wbuf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
             }
             __syncthreads();
         }
         __nv_bfloat16* xbuf = xs + (long)(c & 1) * GRP_MT * XS_STRIDE;
-        __nv_bfloat16* wbuf = ws + (long)(c & 1) * GRP_NT * XS_STRIDE;
+        __nv_bfloat16* wbuf = ws + (long)(c & 1) * NT_TILE * XS_STRIDE;
 #pragma unroll 4
         for (int kk = 0; kk < GRP_KT; kk += 16) {
             wmma::load_matrix_sync(fa, xbuf + m0w * XS_STRIDE + kk, XS_STRIDE);
@@ -1073,16 +1094,17 @@ __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
         __syncthreads();
     }
 
-    wmma::store_matrix_sync(out_s + m0w * (GRP_NT + 8) + n0w, acc, GRP_NT + 8, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        out_s + m0w * (NT_TILE + 8) + n0w, acc, NT_TILE + 8, wmma::mem_row_major);
     __syncthreads();
 
     __nv_bfloat16* ogs[4] = {o0, o1, o2, o3};
     int fs2[4] = {f0, f1, f2, f3};
-    for (int idx = tid; idx < M * GRP_NT; idx += GRP_TPB) {
-        int m = idx / GRP_NT, c = idx % GRP_NT;
+    for (int idx = tid; idx < M * NT_TILE; idx += GRP_TPB) {
+        int m = idx / NT_TILE, c = idx % NT_TILE;
         if (n0 + c >= total_out) continue;
         GrpSeg g = seg_tab[c];
-        float v = out_s[m * (GRP_NT + 8) + c];
+        float v = out_s[m * (NT_TILE + 8) + c];
         __nv_bfloat16* o = ogs[g.mat];
         if (concat_mode) {
             int base = 0;
@@ -1092,11 +1114,13 @@ __global__ void grouped_linear_kernel(const __nv_bfloat16* __restrict__ x,
             o[(long)m * fs2[g.mat] + g.lrow] = __float2bfloat16_rn(v);
         }
     }
+#endif
 }
 
 // Paired-matrix GLU GEMM: out = silu(x@g^T) * (x@u^T). cp.async tile
 // stream: per k-chunk two weight tiles (gate, up) flow through a double
 // buffer while the x tile rides its own pair; compute overlaps loads.
+template <int NT_TILE>
 __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                                 const __nv_bfloat16* __restrict__ g_w,
                                 const __nv_bfloat16* __restrict__ u_w,
@@ -1105,6 +1129,9 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                                 int N,
                                 int K)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    // bf16 WMMA needs sm80+; see the note above the kernel
+
     using namespace nvcuda;
     // dynamic smem: xs[2][MT][KT+8] | ws[2][NT][KT+8] | out_s, out_u [MT][NT+8]
     extern __shared__ char smem_raw[];
@@ -1112,12 +1139,12 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
     __nv_bfloat16* xs = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* ws = xs + 2 * GRP_MT * XS_STRIDE;
     // ws holds 2 slots x (gate,up) tiles = 4*NT rows before the outputs
-    float* out_s = reinterpret_cast<float*>(ws + 4 * GRP_NT * XS_STRIDE);
-    float* out_u = out_s + GRP_MT * (GRP_NT + 8);
+    float* out_s = reinterpret_cast<float*>(ws + 4 * NT_TILE * XS_STRIDE);
+    float* out_u = out_s + GRP_MT * (NT_TILE + 8);
 
     int tid = threadIdx.x;
     int warp = tid >> 5;
-    int n0 = blockIdx.x * GRP_NT;
+    int n0 = blockIdx.x * NT_TILE;
     if (n0 >= N) return;
     int m0w = (warp >> 2) * (GRP_MT / 2);
     int n0w = (warp & 3) * 16;
@@ -1137,19 +1164,22 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
         int kn = min(GRP_KT_GLU, K - k0);
         int kn8 = kn >> 3;
         __nv_bfloat16* xbuf = xs + (long)(c & 1) * GRP_MT * XS_STRIDE;
-        __nv_bfloat16* gw_buf = ws + (long)(c & 1) * 2 * GRP_NT * XS_STRIDE;
-        __nv_bfloat16* uw_buf = gw_buf + (long)GRP_NT * XS_STRIDE;
+        __nv_bfloat16* gw_buf = ws + (long)(c & 1) * 2 * NT_TILE * XS_STRIDE;
+        __nv_bfloat16* uw_buf = gw_buf + (long)NT_TILE * XS_STRIDE;
         for (int idx = tid; idx < M * kn8; idx += GRP_TPB) {
             int m = idx / kn8, j = idx % kn8;
-            __pipeline_memcpy_async(xbuf + (long)m * XS_STRIDE + j * 8, x + (long)m * K + k0 + (long)j * 8, 16);
+            __pipeline_memcpy_async(
+                xbuf + (long)m * XS_STRIDE + j * 8, x + (long)m * K + k0 + (long)j * 8, 16);
         }
-        for (int idx = tid; idx < GRP_NT * kn8; idx += GRP_TPB) {
+        for (int idx = tid; idx < NT_TILE * kn8; idx += GRP_TPB) {
             int r = idx / kn8, j = idx % kn8;
             if (n0 + r < N) {
                 __pipeline_memcpy_async(gw_buf + (long)r * XS_STRIDE + j * 8,
-                                        g_w + (long)(n0 + r) * K + k0 + (long)j * 8, 16);
+                                        g_w + (long)(n0 + r) * K + k0 + (long)j * 8,
+                                        16);
                 __pipeline_memcpy_async(uw_buf + (long)r * XS_STRIDE + j * 8,
-                                        u_w + (long)(n0 + r) * K + k0 + (long)j * 8, 16);
+                                        u_w + (long)(n0 + r) * K + k0 + (long)j * 8,
+                                        16);
             }
         }
         if (kn < GRP_KT_GLU) {
@@ -1158,9 +1188,10 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                 int r = idx / GRP_KT_GLU, cc = idx % GRP_KT_GLU;
                 if (cc >= kn && r < M) xbuf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
             }
-            for (int idx = tid; idx < 2 * GRP_NT * GRP_KT_GLU; idx += GRP_TPB) {
+            for (int idx = tid; idx < 2 * NT_TILE * GRP_KT_GLU; idx += GRP_TPB) {
                 int r = idx / GRP_KT_GLU, cc = idx % GRP_KT_GLU;
-                if (cc >= kn && n0 + (r % GRP_NT) < N) gw_buf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
+                if (cc >= kn && n0 + (r % NT_TILE) < N)
+                    gw_buf[r * XS_STRIDE + cc] = __float2bfloat16_rn(0.f);
             }
         }
         __pipeline_commit();
@@ -1172,8 +1203,8 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
         __pipeline_wait_prior(c + 1 < nchunks ? 1 : 0);
         __syncthreads();
         __nv_bfloat16* xbuf = xs + (long)(c & 1) * GRP_MT * XS_STRIDE;
-        __nv_bfloat16* gw_buf = ws + (long)(c & 1) * 2 * GRP_NT * XS_STRIDE;
-        __nv_bfloat16* uw_buf = gw_buf + (long)GRP_NT * XS_STRIDE;
+        __nv_bfloat16* gw_buf = ws + (long)(c & 1) * 2 * NT_TILE * XS_STRIDE;
+        __nv_bfloat16* uw_buf = gw_buf + (long)NT_TILE * XS_STRIDE;
 #pragma unroll 4
         for (int kk = 0; kk < GRP_KT_GLU; kk += 16) {
             wmma::load_matrix_sync(fa, xbuf + m0w * XS_STRIDE + kk, XS_STRIDE);
@@ -1189,17 +1220,20 @@ __global__ void glu_gemm_kernel(const __nv_bfloat16* __restrict__ x,
         __syncthreads();
     }
 
-    wmma::store_matrix_sync(out_s + m0w * (GRP_NT + 8) + n0w, accg, GRP_NT + 8, wmma::mem_row_major);
-    wmma::store_matrix_sync(out_u + m0w * (GRP_NT + 8) + n0w, accu, GRP_NT + 8, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        out_s + m0w * (NT_TILE + 8) + n0w, accg, NT_TILE + 8, wmma::mem_row_major);
+    wmma::store_matrix_sync(
+        out_u + m0w * (NT_TILE + 8) + n0w, accu, NT_TILE + 8, wmma::mem_row_major);
     __syncthreads();
 
-    for (int idx = tid; idx < M * GRP_NT; idx += GRP_TPB) {
-        int m = idx / GRP_NT, c = idx % GRP_NT;
+    for (int idx = tid; idx < M * NT_TILE; idx += GRP_TPB) {
+        int m = idx / NT_TILE, c = idx % NT_TILE;
         if (n0 + c < N) {
-            float v = silu_f(out_s[m * (GRP_NT + 8) + c]) * out_u[m * (GRP_NT + 8) + c];
+            float v = silu_f(out_s[m * (NT_TILE + 8) + c]) * out_u[m * (NT_TILE + 8) + c];
             out[(long)m * N + n0 + c] = __float2bfloat16_rn(v);
         }
     }
+#endif
 }
 
 std::vector<at::Tensor> grouped_gemm_impl(at::Tensor x,
@@ -1217,12 +1251,15 @@ std::vector<at::Tensor> grouped_gemm_impl(at::Tensor x,
     at::Tensor ws[4] = {w0, w1, w2, w3};
     // the vectorized smem staging does 16-byte transactions
     TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0, "x pointer must be 16B aligned");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0,
+                "x pointer must be 16B aligned");
     for (int i = 0; i < n_mat; i++) {
-        TORCH_CHECK(ws[i].is_cuda() && ws[i].scalar_type() == at::ScalarType::BFloat16, "weights must be CUDA bf16");
+        TORCH_CHECK(ws[i].is_cuda() && ws[i].scalar_type() == at::ScalarType::BFloat16,
+                    "weights must be CUDA bf16");
         TORCH_CHECK(ws[i].is_contiguous(), "weights must be contiguous");
         TORCH_CHECK(ws[i].size(1) == K, "weight K mismatch");
-        TORCH_CHECK((reinterpret_cast<uintptr_t>(ws[i].data_ptr()) & 15) == 0, "weight pointer must be 16B aligned");
+        TORCH_CHECK((reinterpret_cast<uintptr_t>(ws[i].data_ptr()) & 15) == 0,
+                    "weight pointer must be 16B aligned");
     }
     int fs[4] = {0, 0, 0, 0};
     int total = 0;
@@ -1231,7 +1268,7 @@ std::vector<at::Tensor> grouped_gemm_impl(at::Tensor x,
         total += fs[i];
     }
     auto stream = at::cuda::getCurrentCUDAStream();
-    int blocks = (total + GRP_NT - 1) / GRP_NT;
+    int blocks = (total + GRP_NT - 1) / GRP_NT;  // grid covers both variants
     auto opts = x.options();
     std::vector<at::Tensor> outs;
     at::Tensor o0, o1, o2, o3;
@@ -1246,12 +1283,14 @@ std::vector<at::Tensor> grouped_gemm_impl(at::Tensor x,
         outs.push_back(o0);
     }
     at::Tensor dummy = o0.defined() ? o0 : x;  // unused slots point at a live buffer
-        static bool grp_attr_set = false;
+    static bool grp_attr_set = false;
     if (!grp_attr_set) {
-        cudaFuncSetAttribute(grouped_linear_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, GRP_SMEM_BYTES);
+        cudaFuncSetAttribute(grouped_linear_kernel<GRP_NT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             GRP_SMEM_BYTES);
         grp_attr_set = true;
     }
-    grouped_linear_kernel<<<blocks, GRP_TPB, GRP_SMEM_BYTES, stream.stream()>>>(
+    grouped_linear_kernel<GRP_NT><<<blocks, GRP_TPB, GRP_SMEM_BYTES, stream.stream()>>>(
         (const __nv_bfloat16*)x.data_ptr(),
         (const __nv_bfloat16*)(n_mat > 0 ? w0 : dummy).data_ptr(),
         (const __nv_bfloat16*)(n_mat > 1 ? w1 : dummy).data_ptr(),
@@ -1261,11 +1300,17 @@ std::vector<at::Tensor> grouped_gemm_impl(at::Tensor x,
         (__nv_bfloat16*)(want_separate && o1.defined() ? o1 : o0).data_ptr(),
         (__nv_bfloat16*)(want_separate && o2.defined() ? o2 : o0).data_ptr(),
         (__nv_bfloat16*)(want_separate && o3.defined() ? o3 : o0).data_ptr(),
-        fs[0], fs[1], fs[2], fs[3], M, K, total, want_separate ? 0 : 1);
+        fs[0],
+        fs[1],
+        fs[2],
+        fs[3],
+        M,
+        K,
+        total,
+        want_separate ? 0 : 1);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return outs;
 }
-
 
 // Single-token gated-delta-rule recurrent update, IN PLACE on the cache
 // state. Mirrors FLA's fused_recurrent_gated_delta_rule for T=1 with
@@ -1282,9 +1327,13 @@ __global__ void gdn_recurrent_step_kernel(const __nv_bfloat16* __restrict__ q,
                                           int K,
                                           int V)
 {
-    extern __shared__ float smem[];  // state [K*V], then q[K], k[K], v[V]
-    float* h = smem;
-    float* qs = h + (long)K * V;
+    // Only q/k/v stage in shared memory (~1.5KB); the state streams
+    // straight from global. Columns are independent, so the 64KB smem
+    // staging of the original version only capped occupancy at 2
+    // blocks/SM on A100 — removing it raises residency ~8x and lets the
+    // coalesced per-row segments (h[i*V + j..j+31]) saturate bandwidth.
+    extern __shared__ float smem[];  // q[K], k[K], v[V]
+    float* qs = smem;
     float* ks = qs + K;
     float* vs = ks + K;
 
@@ -1292,7 +1341,6 @@ __global__ void gdn_recurrent_step_kernel(const __nv_bfloat16* __restrict__ q,
     const int tid = threadIdx.x;
     const float scale = rsqrtf((float)K);
     float* g_state = state + (long)bh * K * V;
-    for (int idx = tid; idx < K * V; idx += blockDim.x) h[idx] = g_state[idx];
     for (int i = tid; i < K; i += blockDim.x) {
         qs[i] = __bfloat162float(q[(long)bh * K + i]);
         ks[i] = __bfloat162float(k[(long)bh * K + i]);
@@ -1317,30 +1365,29 @@ __global__ void gdn_recurrent_step_kernel(const __nv_bfloat16* __restrict__ q,
     __syncthreads();
     const float inv_qq = rsqrtf(s_red[0] + 1e-6f) * scale;
     const float inv_kk = rsqrtf(s_red[1] + 1e-6f);
-    __syncthreads();
 
     const float decay = __expf(__bfloat162float(g[bh]));
     const float b_beta = __bfloat162float(beta[bh]);
 
     // one thread per state column j: kv = k^T (decay*h), then the
-    // outer-add update and the output dot in a second pass
+    // outer-add update and the output dot, reading/writing the column's
+    // state elements directly (each warp covers one contiguous row
+    // segment per iteration — fully coalesced)
     if (tid < V) {
         const int j = tid;
         float kv = 0.f;
-        for (int i = 0; i < K; i++) kv += ks[i] * h[i * V + j];
+        for (int i = 0; i < K; i++) kv += ks[i] * g_state[i * V + j];
         kv *= decay * inv_kk;
         const float bvj = b_beta * (vs[j] - kv);
         float o = 0.f;
         for (int i = 0; i < K; i++) {
             const float khat = ks[i] * inv_kk;
-            const float hij = decay * h[i * V + j] + khat * bvj;
-            h[i * V + j] = hij;
+            const float hij = decay * g_state[i * V + j] + khat * bvj;
+            g_state[i * V + j] = hij;
             o += qs[i] * inv_qq * hij;
         }
         out[(long)bh * V + j] = __float2bfloat16_rn(o);
     }
-    __syncthreads();
-    for (int idx = tid; idx < K * V; idx += blockDim.x) g_state[idx] = h[idx];
 }
 
 void gdn_recurrent_step(at::Tensor q,
@@ -1352,28 +1399,31 @@ void gdn_recurrent_step(at::Tensor q,
                         at::Tensor out)
 {
     TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::ScalarType::BFloat16, "q must be CUDA bf16");
-    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(), "q/k/v must be contiguous");
-    TORCH_CHECK(state.is_contiguous() && state.scalar_type() == at::ScalarType::Float, "state must be fp32 contiguous");
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous(),
+                "q/k/v must be contiguous");
+    TORCH_CHECK(state.is_contiguous() && state.scalar_type() == at::ScalarType::Float,
+                "state must be fp32 contiguous");
     const int B = (int)q.size(0), H = (int)q.size(1), K = (int)q.size(2), V = (int)v.size(2);
-    TORCH_CHECK(k.sizes() == q.sizes() && v.size(0) == B && v.size(1) == H && v.size(2) == V, "shape mismatch");
-    TORCH_CHECK(state.size(0) == B && state.size(1) == H && state.size(2) == K && state.size(3) == V,
-                "state must be [B,H,K,V]");
+    TORCH_CHECK(k.sizes() == q.sizes() && v.size(0) == B && v.size(1) == H && v.size(2) == V,
+                "shape mismatch");
+    TORCH_CHECK(
+        state.size(0) == B && state.size(1) == H && state.size(2) == K && state.size(3) == V,
+        "state must be [B,H,K,V]");
     TORCH_CHECK(V <= 1024, "V must fit one-thread-per-column");
-    const int smem = (K * V + 2 * K + V) * 4;
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(gdn_recurrent_step_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        attr_set = true;
-    }
+    const int smem = (2 * K + V) * 4;
     auto stream = at::cuda::getCurrentCUDAStream();
     gdn_recurrent_step_kernel<<<B * H, (V + 31) / 32 * 32, smem, stream.stream()>>>(
-        (const __nv_bfloat16*)q.data_ptr(), (const __nv_bfloat16*)k.data_ptr(),
-        (const __nv_bfloat16*)v.data_ptr(), (const __nv_bfloat16*)g.data_ptr(),
-        (const __nv_bfloat16*)beta.data_ptr(), (float*)state.data_ptr(),
-        (__nv_bfloat16*)out.data_ptr(), K, V);
+        (const __nv_bfloat16*)q.data_ptr(),
+        (const __nv_bfloat16*)k.data_ptr(),
+        (const __nv_bfloat16*)v.data_ptr(),
+        (const __nv_bfloat16*)g.data_ptr(),
+        (const __nv_bfloat16*)beta.data_ptr(),
+        (float*)state.data_ptr(),
+        (__nv_bfloat16*)out.data_ptr(),
+        K,
+        V);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-
 
 py::dict segki_capabilities()
 {
@@ -1407,36 +1457,110 @@ at::Tensor quad_gemm(at::Tensor x, at::Tensor w_qkv, at::Tensor w_z, at::Tensor 
 at::Tensor dual_gemm_silu_mul(at::Tensor x, at::Tensor gate_w, at::Tensor up_w)
 {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::ScalarType::BFloat16, "x must be CUDA bf16");
-    TORCH_CHECK(x.is_contiguous() && gate_w.is_contiguous() && up_w.is_contiguous(), "inputs must be contiguous");
+    TORCH_CHECK(x.is_contiguous() && gate_w.is_contiguous() && up_w.is_contiguous(),
+                "inputs must be contiguous");
     TORCH_CHECK(x.dim() == 2 && x.size(0) > 1 && x.size(0) <= GRP_MT, "batch must be 2..32");
     int M = (int)x.size(0), K = (int)x.size(1), N = (int)gate_w.size(0);
     TORCH_CHECK(K % 8 == 0, "K must be a multiple of 8");
-    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0
-                    && (reinterpret_cast<uintptr_t>(gate_w.data_ptr()) & 15) == 0
-                    && (reinterpret_cast<uintptr_t>(up_w.data_ptr()) & 15) == 0,
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(x.data_ptr()) & 15) == 0 &&
+                    (reinterpret_cast<uintptr_t>(gate_w.data_ptr()) & 15) == 0 &&
+                    (reinterpret_cast<uintptr_t>(up_w.data_ptr()) & 15) == 0,
                 "inputs must be 16B aligned");
     TORCH_CHECK(up_w.size(0) == N && gate_w.size(1) == K && up_w.size(1) == K, "shape mismatch");
     auto out = at::empty({M, N}, x.options());
     auto stream = at::cuda::getCurrentCUDAStream();
     int blocks = (N + GRP_NT - 1) / GRP_NT;
-        static bool glu_attr_set = false;
+    static bool glu_attr_set = false;
     if (!glu_attr_set) {
-        cudaFuncSetAttribute(glu_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, GRP_GLU_SMEM_BYTES);
+        cudaFuncSetAttribute(glu_gemm_kernel<GRP_NT>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             GRP_GLU_SMEM_BYTES);
         glu_attr_set = true;
     }
-    glu_gemm_kernel<<<blocks, GRP_TPB, GRP_GLU_SMEM_BYTES, stream.stream()>>>((const __nv_bfloat16*)x.data_ptr(),
-                                                             (const __nv_bfloat16*)gate_w.data_ptr(),
-                                                             (const __nv_bfloat16*)up_w.data_ptr(),
-                                                             (__nv_bfloat16*)out.data_ptr(), M, N, K);
+    glu_gemm_kernel<GRP_NT><<<blocks, GRP_TPB, GRP_GLU_SMEM_BYTES, stream.stream()>>>(
+        (const __nv_bfloat16*)x.data_ptr(),
+        (const __nv_bfloat16*)gate_w.data_ptr(),
+        (const __nv_bfloat16*)up_w.data_ptr(),
+        (__nv_bfloat16*)out.data_ptr(),
+        M,
+        N,
+        K);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
+}
+
+namespace {
+// GLU epilogue as a standalone native kernel: bf16 in/out, fp32
+// sigmoid in registers — no dtype round-trip through gmem.
+__global__ void silu_mul_kernel(const __nv_bfloat16* __restrict__ gu,
+                                __nv_bfloat16* __restrict__ out,
+                                long long rows,
+                                int n)
+{
+    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const long long total = rows * n;
+    for (; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const long long r = i / n;
+        const int j = (int)(i % n);
+        const long long base = r * 2 * n;
+        const float g = __bfloat162float(gu[base + j]);
+        const float u = __bfloat162float(gu[base + n + j]);
+        out[i] = __float2bfloat16(g / (1.0f + __expf(-g)) * u);
+    }
+}
+}  // namespace
+
+at::Tensor silu_mul(at::Tensor gu, int64_t n)
+{
+    auto out = at::empty({gu.size(0), n}, gu.options());
+    const long long total = (long long)gu.size(0) * n;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = (int)((total + 255) / 256);
+    silu_mul_kernel<<<blocks, 256, 0, stream.stream()>>>(
+        (const __nv_bfloat16*)gu.data_ptr(), (__nv_bfloat16*)out.data_ptr(), gu.size(0), (int)n);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// Pointer-keyed cache of concatenated GLU weights (see grouped_linear).
+// In-place weight writes (arena/reshard syncs) keep their addresses, so
+// the sync path calls clear_glu_cat_cache() to drop stale concats.
+struct PairKey {
+    uint64_t a, b;
+    bool operator==(const PairKey& o) const { return a == o.a && b == o.b; }
+};
+struct PairHash {
+    size_t operator()(const PairKey& k) const { return std::hash<uint64_t>()(k.a ^ (k.b << 1)); }
+};
+static std::unordered_map<PairKey, at::Tensor, PairHash> g_glu_cat_cache;
+
+void clear_glu_cat_cache() { g_glu_cat_cache.clear(); }
+
+// Arch-adaptive batch routing threshold: on Ada the WMMA grouped kernel
+// beats cuBLAS for M<=32 (launch overhead dominates); on Ampere cuBLAS
+// is fast enough to win at any M>1 (profiled on A100 SXM4: our WMMA at
+// 39.7% of step vs cuBLAS composite scaling better). Same interface,
+// same kernels — only the crossover point moves.
+static int64_t grouped_wmma_threshold()
+{
+    static int64_t thr = -1;
+    if (thr < 0) {
+        int dev;
+        cudaGetDevice(&dev);
+        int smem;
+        cudaDeviceGetAttribute(&smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        thr = (smem > 100 * 1024) ? 1 : GRP_MT;  // Ampere -> 1, Ada -> GRP_MT
+    }
+    return thr;
 }
 
 // Portable segKI interface: one dispatcher routes by weight count and
 // batch size to this backend's private kernels (gemv / WMMA grouped /
 // aten composite), so other accelerators can expose the same entry with
 // an entirely different internal split.
-std::vector<at::Tensor> grouped_linear(at::Tensor x, std::vector<at::Tensor> weights, bool glu_epilogue)
+std::vector<at::Tensor> grouped_linear(at::Tensor x,
+                                       std::vector<at::Tensor> weights,
+                                       bool glu_epilogue)
 {
     const size_t n = weights.size();
     TORCH_CHECK(n >= 1 && n <= 6, "grouped_linear takes 1..6 weight matrices");
@@ -1460,8 +1584,9 @@ std::vector<at::Tensor> grouped_linear(at::Tensor x, std::vector<at::Tensor> wei
         }
         if (!glu_epilogue && n == 3) return triple_gemv(flat, weights[0], weights[1], weights[2]);
         if (!glu_epilogue && n == 4) {
-            auto out = at::empty({weights[0].size(0) + weights[1].size(0) + weights[2].size(0) + weights[3].size(0)},
-                                 x.options());
+            auto out = at::empty(
+                {weights[0].size(0) + weights[1].size(0) + weights[2].size(0) + weights[3].size(0)},
+                x.options());
             quad_gemv(flat, weights[0], weights[1], weights[2], weights[3], out);
             return {out};
         }
@@ -1477,7 +1602,42 @@ std::vector<at::Tensor> grouped_linear(at::Tensor x, std::vector<at::Tensor> wei
     }
     at::Tensor x2 = x.reshape({-1, K});
     const int64_t M = x2.size(0);
-    if (M > GRP_MT) {
+    // GLU routing by architecture (the dispatcher owns the choice):
+    // - Ampere: one wide cuBLAS GEMM over the concat-cached gate|up weight
+    //   plus the native silu_mul epilogue — cuBLAS tiles [M,2N,K] better
+    //   than our WMMA at these shapes and silu_mul costs one tiny kernel
+    //   (no fp32 round-trip, unlike the composite compared in loop 3).
+    // - Ada: the WMMA fused kernel keeps the in-register epilogue (it wins
+    //   there); M in (GRP_MT, 2*GRP_MT] rides two row-chunked calls.
+    if (glu_epilogue && n == 2) {
+        if (grouped_wmma_threshold() > 1) {
+            if (M <= GRP_MT) return {dual_gemm_silu_mul(x2, weights[0], weights[1])};
+            if (M <= 2 * GRP_MT) {
+                const int64_t half = GRP_MT;
+                at::Tensor out = at::empty({M, weights[0].size(0)}, x2.options());
+                auto o1 = dual_gemm_silu_mul(x2.narrow(0, 0, half), weights[0], weights[1]);
+                auto o2 = dual_gemm_silu_mul(x2.narrow(0, half, M - half), weights[0], weights[1]);
+                out.narrow(0, 0, half).copy_(o1);
+                out.narrow(0, half, M - half).copy_(o2);
+                return {out};
+            }
+        } else {
+            // Ampere: weights are static across the rollout — cache the
+            // concatenated [gate; up] matrix keyed by the weight pointers
+            // (g_glu_cat_cache; cleared by clear_glu_cat_cache() when an
+            // arena/reshard sync writes weights in place)
+            const PairKey key{(uint64_t)(uintptr_t)weights[0].data_ptr(),
+                              (uint64_t)(uintptr_t)weights[1].data_ptr()};
+            auto it = g_glu_cat_cache.find(key);
+            if (it == g_glu_cat_cache.end()) {
+                auto cat = at::cat({weights[0], weights[1]}, 0).contiguous();
+                it = g_glu_cat_cache.emplace(key, cat).first;
+            }
+            auto gu = at::matmul(x2, it->second.t());
+            return {silu_mul(gu, weights[0].size(0))};
+        }
+    }
+    if (M > grouped_wmma_threshold()) {
         // large batches: cuBLAS/aten composite (this backend's measured choice)
         std::vector<at::Tensor> outs;
         for (auto& w : weights) outs.push_back(at::matmul(x2, w.t()));
@@ -1491,18 +1651,73 @@ std::vector<at::Tensor> grouped_linear(at::Tensor x, std::vector<at::Tensor> wei
     TORCH_CHECK(x2.is_contiguous(), "grouped_linear needs a contiguous [M,K] view");
     if (glu_epilogue && n == 2) return {dual_gemm_silu_mul(x2, weights[0], weights[1])};
     if (!glu_epilogue && n == 3) return triple_gemm(x2, weights[0], weights[1], weights[2]);
-    if (!glu_epilogue && n == 4) return {quad_gemm(x2, weights[0], weights[1], weights[2], weights[3])};
+    if (!glu_epilogue && n == 4)
+        return {quad_gemm(x2, weights[0], weights[1], weights[2], weights[3])};
     if (!glu_epilogue && n == 1) return {single_gemm(x2, weights[0])};
     // glu with n != 2 or multi-output without epilogue at n == 2: composite
     std::vector<at::Tensor> outs;
     for (auto& w : weights) outs.push_back(at::matmul(x2, w.t()));
     if (glu_epilogue && n == 2) {
-            at::Tensor g = at::silu(outs[0].to(at::kFloat)).to(outs[0].scalar_type());
-            outs = {g * outs[1]};
-        }
+        at::Tensor g = at::silu(outs[0].to(at::kFloat)).to(outs[0].scalar_type());
+        outs = {g * outs[1]};
+    }
     return outs;
 }
 
+namespace {
+// Head-repeat for the GDN scan's v-head layout: out[b,s,hv,d] = in[b,s,hv/ratio,d].
+// One launch covers BOTH q and k (idx space 2*total), replacing two eager
+// repeat_interleave copies per layer.
+__global__ void repeat_qk_kernel(const __nv_bfloat16* __restrict__ q,
+                                 const __nv_bfloat16* __restrict__ k,
+                                 __nv_bfloat16* __restrict__ q_out,
+                                 __nv_bfloat16* __restrict__ k_out,
+                                 long long src_rows,
+                                 int dk,
+                                 int hv,
+                                 int ratio,
+                                 long long total)
+{
+    long long idx = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool is_k = idx >= total;
+    const long long i = is_k ? idx - total : idx;
+    if (i >= total) return;
+    const int d = (int)(i % dk);
+    long long t = i / dk;
+    const int h = (int)(t % hv);
+    t /= hv;  // flat [B*S] row
+    const long long src = (t * src_rows + h / ratio) * dk + d;
+    if (is_k)
+        k_out[i] = k[src];
+    else
+        q_out[i] = q[src];
+}
+}  // namespace
+
+std::vector<at::Tensor> repeat_qk(at::Tensor q, at::Tensor k, int64_t ratio)
+{
+    const auto sz = q.sizes();
+    TORCH_CHECK(q.is_contiguous() && k.is_contiguous(), "repeat_qk needs contiguous q/k");
+    const long long B = sz[0], S = sz[1], Hk = sz[2];
+    const int dk = (int)sz[3];
+    const int hv = (int)(Hk * ratio);
+    auto q_out = at::empty({B, S, (long long)hv, (long long)dk}, q.options());
+    auto k_out = at::empty_like(q_out);
+    const long long total = B * S * hv * dk;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = (int)((2 * total + 255) / 256);
+    repeat_qk_kernel<<<blocks, 256, 0, stream.stream()>>>((const __nv_bfloat16*)q.data_ptr(),
+                                                          (const __nv_bfloat16*)k.data_ptr(),
+                                                          (__nv_bfloat16*)q_out.data_ptr(),
+                                                          (__nv_bfloat16*)k_out.data_ptr(),
+                                                          Hk,
+                                                          dk,
+                                                          hv,
+                                                          (int)ratio,
+                                                          total);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {q_out, k_out};
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
@@ -1556,6 +1771,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("x"),
           py::arg("weights"),
           py::arg("glu_epilogue") = false);
+    m.def("repeat_qk", &repeat_qk, "fused q/k head-repeat for the scan (one launch)");
+    m.def("silu_mul", &silu_mul, "native GLU epilogue: silu(g)*u from a [M,2N] buffer");
+    m.def("clear_glu_cat_cache",
+          &clear_glu_cat_cache,
+          "drop stale concat caches after in-place weight writes");
     m.def("capabilities", &segki_capabilities, "segKI backend capability report");
     m.def("gdn_recurrent_step",
           &gdn_recurrent_step,
@@ -1567,32 +1787,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("beta"),
           py::arg("state"),
           py::arg("out"));
-    m.def("single_gemm",
-          &single_gemm,
-          "single-matrix GEMM on the grouped kernel (small batches)",
-          py::arg("x"),
-          py::arg("w"));
-    m.def("triple_gemm",
-          &triple_gemm,
-          "grouped q/k/v GEMM for small batches (2..32), no weight copies",
-          py::arg("x"),
-          py::arg("q_w"),
-          py::arg("k_w"),
-          py::arg("v_w"));
-    m.def("quad_gemm",
-          &quad_gemm,
-          "grouped GDN input-projection GEMM (qkv|z|b|a) -> concat, small batches",
-          py::arg("x"),
-          py::arg("w_qkv"),
-          py::arg("w_z"),
-          py::arg("w_b"),
-          py::arg("w_a"));
-    m.def("dual_gemm_silu_mul",
-          &dual_gemm_silu_mul,
-          "grouped gate/up GEMM with silu(g)*u epilogue, small batches",
-          py::arg("x"),
-          py::arg("gate_w"),
-          py::arg("up_w"));
     m.def("decode_attn",
           &decode_attn,
           "batched decode attention (GQA, valid-length, fused q-norm/rope/gate)",
@@ -1616,10 +1810,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
           py::arg("rope_dim"));
     m.def("decode_step_graph", &decode_step_graph, "graph-capturable decode step (CUDA)");
     m.def("gdn_gates", &gdn_gates, "fused GDN beta/g gating (CUDA)");
-    m.def("quad_gemv", &quad_gemv, "b=1 GDN 4-weight input GEMV (qkv|z|b|a), no concat (CUDA)");
-    m.def("dual_gemv_silu_mul",
-          &dual_gemv_silu_mul,
-          "b=1 GEMV reading gate|up weights separately: silu(h*Wg)*(h*Wu) (CUDA)");
     m.def("fused_add_norm",
           &fused_add_norm,
           "fused residual add + RMSNorm, in-place residual update (CUDA)");
@@ -1656,7 +1846,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("w"),
         py::arg("out"),
         py::arg("eps"));
-    m.def("triple_gemv",
-          &triple_gemv,
-          "b=1 QKV GEMV reading q/k/v weights directly, no concat (CUDA)");
 }

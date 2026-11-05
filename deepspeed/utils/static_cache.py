@@ -233,6 +233,11 @@ class DSStaticGDNSlot:
 
 
 class DeepSpeedStaticCache:
+    # Mirrors HF StaticCache: static buffers answer mask builders with
+    # full-width masks (is_compileable), which must match the full-width
+    # K/V buffers update() returns; a position-truncated mask against a
+    # full-width buffer crashes SDPA at decode.
+    is_compileable = True
     """CUDA-graph-compatible static KV cache.
 
     Drop-in replacement for ``transformers.StaticCache`` in the graph-capture

@@ -28,12 +28,10 @@ import torch
 from deepspeed.accelerator import get_accelerator
 
 from deepspeed.module_inject.kernel_reference import decode_attn as ref_decode_attn
-from deepspeed.module_inject.kernel_reference import dual_gemv_silu_mul as ref_dual_gemv
 from deepspeed.module_inject.kernel_reference import fused_add_norm as ref_add_norm
 from deepspeed.module_inject.kernel_reference import gdn_gates as ref_gdn_gates
 from deepspeed.module_inject.kernel_reference import gated_norm as ref_gated_norm
-from deepspeed.module_inject.kernel_reference import gdn_input_proj as ref_gdn_proj
-from deepspeed.module_inject.kernel_reference import triple_gemv as ref_triple_gemv
+from deepspeed.module_inject.kernel_reference import grouped_linear as ref_grouped_linear
 
 DEV = get_accelerator().device_name()
 
@@ -55,6 +53,11 @@ def _kernel_op_available() -> bool:
 
 GPU_AVAILABLE = _kernel_op_available()
 
+
+def _as_concat(parts):
+    """Normalize grouped_linear output: some routing paths return
+    concatenated (list of 1), others separate (list of n)."""
+    return torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
 
 def _op():
     from deepspeed.ops.module_inject import get_fused_glu_op
@@ -232,18 +235,16 @@ class TestKernelReferenceConsistency:
         gw = _rand_bf16(384, 256)
         uw = _rand_bf16(384, 256)
         out = torch.empty(384, dtype=torch.bfloat16, device=DEV)
-        _op().dual_gemv_silu_mul(h, gw, uw, out)
-        expected = ref_dual_gemv(h.float(), gw.float(), uw.float())
+        out = _op().grouped_linear(h, [gw, uw], True)[0]
+        expected = ref_grouped_linear(h.float(), [gw.float(), uw.float()], True)[0]
         torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
 
     def test_quad_gemv(self):
         h = _rand_bf16(128)
         ws = [_rand_bf16(rows, 128) for rows in (96, 48, 6, 6)]
-        total = sum(w.shape[0] for w in ws)
-        out = torch.empty(total, dtype=torch.bfloat16, device=DEV)
-        _op().quad_gemv(h, *ws, out)
-        expected = ref_gdn_proj(h.float(), *[w.float() for w in ws])
-        torch.testing.assert_close(out.float(), expected, atol=5e-2, rtol=5e-2)
+        cat = _as_concat(_op().grouped_linear(h, list(ws), False))
+        expected = torch.cat(ref_grouped_linear(h.float(), [w.float() for w in ws], False), dim=-1)
+        torch.testing.assert_close(cat.float(), expected, atol=5e-2, rtol=5e-2)
 
     def test_gdn_gates(self):
         # a/b are [batch, seq, heads]; a_log/dt are per-head [heads] (real usage shapes)
@@ -259,8 +260,8 @@ class TestKernelReferenceConsistency:
     def test_triple_gemv(self):
         h = _rand_bf16(128)
         qw, kw, vw = (_rand_bf16(64, 128) for _ in range(3))
-        q, k, v = _op().triple_gemv(h, qw, kw, vw)
-        ref_q, ref_k, ref_v = ref_triple_gemv(h.float(), qw.float(), kw.float(), vw.float())
+        q, k, v = _op().grouped_linear(h, [qw, kw, vw], False)
+        ref_q, ref_k, ref_v = ref_grouped_linear(h.float(), [qw.float(), kw.float(), vw.float()], False)
         for got, exp in ((q, ref_q), (k, ref_k), (v, ref_v)):
             torch.testing.assert_close(got.float(), exp, atol=5e-2, rtol=5e-2)
 
@@ -452,7 +453,7 @@ class TestInjectionInvariants:
         h = torch.randn(1, 4, 32, dtype=torch.bfloat16)
         ws = [torch.randn(r, 32, dtype=torch.bfloat16) for r in (40, 16, 4, 4)]
         got = GDNInputProj.apply(h, *ws, None)
-        expected = ref_gdn_proj(h, *ws)
+        expected = torch.cat(ref_grouped_linear(h.float(), [w.float() for w in ws], False), dim=-1)
         torch.testing.assert_close(got.float(), expected.float(), atol=1e-2, rtol=1e-2)
 
     def test_composite_backward_scatters_to_original_weights(self):
@@ -542,32 +543,32 @@ class TestRolloutTrainRollout:
             K, fq, fk, fv = 128, 64, 32, 32
             x = _rand_bf16(M, K)
             qw, kw, vw = _rand_bf16(fq, K), _rand_bf16(fk, K), _rand_bf16(fv, K)
-            rq, rk, rv = ref.triple_gemm(x.float(), qw.float(), kw.float(), vw.float())
-            q_out, k_out, v_out = _op().triple_gemm(x, qw, kw, vw)
+            rq, rk, rv = ref.grouped_linear(x.float(), [qw.float(), kw.float(), vw.float()], False)
+            q_out, k_out, v_out = _op().grouped_linear(x, [qw, kw, vw], False)
             torch.testing.assert_close(q_out.float(), rq, atol=5e-2, rtol=5e-2)
             torch.testing.assert_close(k_out.float(), rk, atol=5e-2, rtol=5e-2)
             torch.testing.assert_close(v_out.float(), rv, atol=5e-2, rtol=5e-2)
 
             gz_w, b_w, a_w = _rand_bf16(48, K), _rand_bf16(16, K), _rand_bf16(16, K)
-            cat = _op().quad_gemm(x, qw, gz_w, b_w, a_w)
-            torch.testing.assert_close(cat.float(),
-                                       ref.quad_gemm(x.float(), qw.float(), gz_w.float(), b_w.float(), a_w.float()),
-                                       atol=5e-2,
-                                       rtol=5e-2)
+            w4 = [qw, gz_w, b_w, a_w]
+            parts = _op().grouped_linear(x, w4, False)
+            cat = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
+            ref_parts = ref.grouped_linear(x.float(), [w.float() for w in w4], False)
+            ref_cat = torch.cat(ref_parts, dim=-1)
+            torch.testing.assert_close(cat.float(), ref_cat, atol=5e-2, rtol=5e-2)
 
             gw, uw = _rand_bf16(fq, K), _rand_bf16(fq, K)
-            glu = _op().dual_gemm_silu_mul(x, gw, uw)
-            torch.testing.assert_close(glu.float(),
-                                       ref.dual_gemm_silu_mul(x.float(), gw.float(), uw.float()),
-                                       atol=5e-2,
-                                       rtol=5e-2)
+            glu = _op().grouped_linear(x, [gw, uw], True)[0]
+            ref_glu = ref.grouped_linear(x.float(), [gw.float(), uw.float()], True)[0]
+            torch.testing.assert_close(glu.float(), ref_glu, atol=5e-2, rtol=5e-2)
 
     def test_grouped_gemm_rejects_out_of_range(self):
         import pytest as _pytest
-        x = _rand_bf16(33, 64)
+        x = _rand_bf16(32, 64)
         w = _rand_bf16(32, 64)
         with _pytest.raises(RuntimeError):
-            _op().dual_gemm_silu_mul(x, w, w)
+            # 7 weights exceeds the dispatcher's supported range (1..6)
+            _op().grouped_linear(x, [w] * 7, False)
 
     def test_grouped_linear_dispatcher(self):
         """The portable interface entry: weight count x batch routing vs the
@@ -579,6 +580,7 @@ class TestRolloutTrainRollout:
             x = _rand_bf16(M, K) if M > 1 else _rand_bf16(K)
             w1 = _rand_bf16(64, K)
             out = op.grouped_linear(x, [w1], False)
+            assert len(out) >= 1, f"grouped_linear returned empty for M={M}, n=1"
             if M > op.capabilities()["max_grouped_batch"]:
                 # composite route: bf16 matmul (same rounding as the route)
                 exp = torch.matmul(x.reshape(-1, K) if M > 1 else x, w1.t())
@@ -593,11 +595,10 @@ class TestRolloutTrainRollout:
             # eager semantics); the fp32 reference skips that rounding, so
             # anchor large batches on the same-dtype reference instead
             if M > op.capabilities()["max_grouped_batch"]:
-                ref_glu = ref.dual_gemm_silu_mul(x if M > 1 else x, gw, uw)
+                ref_glu = ref.grouped_linear(x, [gw, uw], True)[0]
                 torch.testing.assert_close(out[0].float(), ref_glu.float().reshape(out[0].shape), atol=5e-2, rtol=5e-2)
             else:
-                ref_glu = ref.dual_gemm_silu_mul(x.float().reshape(-1, K) if M > 1 else x.float(), gw.float(),
-                                                 uw.float())
+                ref_glu = ref.grouped_linear(x.float().reshape(-1, K) if M > 1 else x.float(), [gw.float(), uw.float()], True)[0]
                 torch.testing.assert_close(out[0].float(), ref_glu.reshape(out[0].shape), atol=5e-2, rtol=5e-2)
 
             kw, vw = _rand_bf16(32, K), _rand_bf16(32, K)
@@ -609,16 +610,154 @@ class TestRolloutTrainRollout:
             torch.testing.assert_close(q.float(), rq.float().reshape(q.shape), atol=5e-2, rtol=5e-2)
 
             z, b, a = _rand_bf16(48, K), _rand_bf16(16, K), _rand_bf16(16, K)
-            cat = op.grouped_linear(x, [w1, z, b, a], False)[0]
+            q_parts = op.grouped_linear(x, [w1, z, b, a], False)
+            assert len(q_parts) >= 1, f"grouped_linear returned empty for M={M}, n=4"
+            cat = _as_concat(q_parts)
             xq = x.reshape(-1, K) if M > 1 else x
             if M > op.capabilities()["max_grouped_batch"]:
-                rc = ref.quad_gemm(xq, w1, z, b, a).float()  # composite: bf16 matmul
+                rc = torch.cat(ref.grouped_linear(xq, [w1, z, b, a], False), dim=-1).float()
                 torch.testing.assert_close(cat.float(), rc.reshape(cat.shape), atol=5e-2, rtol=5e-2)
             else:
-                rc = ref.quad_gemm(xq.float(), w1.float(), z.float(), b.float(), a.float())
+                rc = torch.cat(ref.grouped_linear(xq.float(), [w1.float(), z.float(), b.float(), a.float()], False), dim=-1)
                 torch.testing.assert_close(cat.float(), rc.reshape(cat.shape), atol=5e-2, rtol=5e-2)
         caps = op.capabilities()
         assert caps["max_grouped_batch"] >= 32 and "bf16" in list(caps["dtypes"])
+
+
+class TestArenaWeightViews:
+    """Contract for arena/reshard syncs: weights updated IN PLACE (same
+    addresses, new values) with segki_refresh() called afterwards must
+    produce exactly what a fresh injection over the same weights produces
+    — bitwise. Without the refresh, derived caches serve stale copies
+    mixed with fresh direct reads."""
+
+    def _make_rollout(self, tok):
+        from deepspeed.runtime.rollout.hybrid_engine_rollout import HybridEngineRollout, HybridEngineRolloutConfig
+        from transformers import AutoModelForCausalLM
+        m = AutoModelForCausalLM.from_pretrained(_TEST_MODEL, dtype=torch.bfloat16).to(get_accelerator().device_name())
+
+        class Shim:
+
+            def __init__(self, m):
+                self.module = m
+                self._cfg = m.config
+
+        shim = Shim(m)
+        if isinstance(getattr(shim.module, "config", None), dict):
+            shim.module.config = m.config
+        # graph capture needs a real accelerator: CPU stubs return None streams
+        # and no-op graph replays, so the eager path exercises the same
+        # weight-view contract there
+        graphs_ok = get_accelerator().device_name() != "cpu"
+        rollout = HybridEngineRollout(shim, tok, HybridEngineRolloutConfig(use_graph_capture=graphs_ok,
+                                                                           use_segki=True))
+        return rollout, m
+
+    def _gen(self, rollout, ids):
+        from deepspeed.runtime.rollout.base import RolloutRecord, RolloutRequest, SamplingConfig
+        samples = [RolloutRecord(tokens=row, attention_mask=[1] * len(row)) for row in ids.tolist()]
+        out = rollout.generate(RolloutRequest(samples=samples), SamplingConfig(max_new_tokens=16, temperature=0.0))
+        return torch.tensor([sample.tokens[ids.shape[1]:] for sample in out.samples])
+
+    def test_inplace_update_refresh_matches_fresh_injection(self):
+        pytest.importorskip("transformers")
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(_TEST_MODEL)
+        except Exception as e:
+            pytest.skip(f"model {_TEST_MODEL} unavailable: {e}")
+        object.__setattr__(tok, "eos_token_id", -1)
+        torch.manual_seed(11)
+        ids = torch.randint(1000, 50000, (2, 128), device=get_accelerator().device_name())
+
+        # baseline rollout — its first generate builds the derived caches
+        rollout, m = self._make_rollout(tok)
+        self._gen(rollout, ids)
+
+        # in-place weight update (arena sync semantics: same storage)
+        with torch.no_grad():
+            for p in m.parameters():
+                p.mul_(1.5)
+
+        # the handshake
+        from deepspeed.module_inject.segment_ki import segki_refresh
+        segki_refresh(m)
+        out_refreshed = self._gen(rollout, ids)
+
+        # ground truth: a fresh injection over the SAME updated weights
+        rollout2, m2 = self._make_rollout(tok)
+        with torch.no_grad():
+            for p2, p in zip(m2.parameters(), m.parameters()):
+                p2.copy_(p)
+        self._gen(rollout2, ids)  # builds fresh caches on the right values
+        out_fresh = self._gen(rollout2, ids)
+
+        assert torch.equal(
+            out_refreshed,
+            out_fresh), (f"refresh path diverged from fresh injection: "
+                         f"{(out_refreshed != out_fresh).sum().item()} of {out_fresh.numel()} tokens differ")
+
+    def test_arena_view_binding_survives_inplace_writes(self):
+        pytest.importorskip("transformers")
+        try:
+            from transformers import AutoTokenizer
+            tok = AutoTokenizer.from_pretrained(_TEST_MODEL)
+        except Exception as e:
+            pytest.skip(f"model {_TEST_MODEL} unavailable: {e}")
+        object.__setattr__(tok, "eos_token_id", -1)
+        torch.manual_seed(23)
+        ids = torch.randint(1000, 50000, (2, 128), device=get_accelerator().device_name())
+
+        # bind parameter storage to external arena tensors, then update
+        # the ARENA in place — parameters must see the new values without
+        # any rebinding (fixed-address contract)
+        rollout, m = self._make_rollout(tok)
+        arena = {n: p.detach().clone() for n, p in m.named_parameters()}
+        with torch.no_grad():
+            for n, p in m.named_parameters():
+                p.data = arena[n]
+        self._gen(rollout, ids)  # caches built against arena storage
+
+        with torch.no_grad():
+            for t in arena.values():
+                t.mul_(0.75)  # reshard writes NEW values into the SAME arena
+
+        from deepspeed.module_inject.segment_ki import segki_refresh
+        segki_refresh(m)
+        out_after = self._gen(rollout, ids)
+
+        rollout2, m2 = self._make_rollout(tok)
+        with torch.no_grad():
+            for n, p2 in m2.named_parameters():
+                p2.copy_(arena[n])
+        self._gen(rollout2, ids)
+        out_fresh = self._gen(rollout2, ids)
+
+        assert torch.equal(out_after, out_fresh), "arena in-place write + refresh diverged from fresh injection"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="native kernels are CUDA-only")
+class TestAmpereGlueReferences:
+    """Direct reference anchors for the glue kernels that entered after the
+    original ten: the Ampere GLU epilogue and the scan head-repeat."""
+
+    def test_silu_mul_matches_reference(self):
+        from deepspeed.module_inject.kernel_reference import silu_mul as ref_silu_mul
+        for M, n in ((32, 4608), (1, 2304), (64, 128)):
+            gu = _rand_bf16(M, 2 * n)
+            out = _op().silu_mul(gu, n)
+            r = ref_silu_mul(gu.float(), n)
+            torch.testing.assert_close(out.float(), r, atol=5e-2, rtol=5e-2)
+
+    def test_repeat_qk_matches_reference(self):
+        from deepspeed.module_inject.kernel_reference import repeat_qk as ref_repeat_qk
+        for B, Hk, dk, ratio in ((32, 8, 128, 2), (4, 16, 128, 2), (64, 4, 64, 4)):
+            q = _rand_bf16(B, 1, Hk, dk)
+            k = _rand_bf16(B, 1, Hk, dk)
+            qo, ko = _op().repeat_qk(q, k, ratio)
+            qr, kr = ref_repeat_qk(q, k, ratio)
+            torch.testing.assert_close(qo.float(), qr.float(), atol=0, rtol=0)
+            torch.testing.assert_close(ko.float(), kr.float(), atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
