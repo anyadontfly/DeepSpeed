@@ -45,7 +45,8 @@ class RolloutConfig:
 class SamplingConfig:
     """Sampling knobs that the trainer passes to ``generate`` each step.
 
-    ``top_k <= 0`` disables top-k filtering.
+    ``top_k <= 0`` disables top-k filtering. ``repetition_penalty=None`` uses the
+    value in the model's ``generation_config``; 1.0 disables the penalty.
     """
 
     max_new_tokens: int
@@ -56,6 +57,7 @@ class SamplingConfig:
     n_samples_per_prompt: int = 1
     continuous_batch_size: Optional[int] = None
     return_log_probs: bool = False
+    repetition_penalty: Optional[float] = None
 
 
 @dataclass

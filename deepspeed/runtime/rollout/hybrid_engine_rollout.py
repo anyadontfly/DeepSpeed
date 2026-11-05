@@ -145,8 +145,10 @@ def _token_selector(sampling):
     return select_sampled
 
 
-def _checkpoint_repetition_penalty(module):
-    """The penalty in the model's ``generation_config``, which ``generate()`` applies too; 1.0 when it has none."""
+def _repetition_penalty(sampling, module):
+    """``sampling``'s penalty, else the one in the model's ``generation_config``, as ``generate()`` does; else 1.0."""
+    if sampling.repetition_penalty is not None:
+        return sampling.repetition_penalty
     penalty = getattr(getattr(module, "generation_config", None), "repetition_penalty", None)
     return penalty if isinstance(penalty, (int, float)) else 1.0
 
@@ -646,7 +648,7 @@ class HybridEngineRollout(RolloutEngine):
         pad_token_id = self.tokenizer.pad_token_id
         eos_token_id = self.tokenizer.eos_token_id
         select_next_tokens = _token_selector(sampling)
-        repetition_penalty = _checkpoint_repetition_penalty(module)
+        repetition_penalty = _repetition_penalty(sampling, module)
         # With a repetition penalty, which tokens each row's trajectory holds, so a decode step needs no host read.
         seen_tokens = None
         max_new_tokens = sampling.max_new_tokens
@@ -999,12 +1001,14 @@ class HybridEngineRollout(RolloutEngine):
         return_log_probs = sampling.return_log_probs
         if return_log_probs and sampling.temperature > 0.0 and (sampling.top_p < 1.0 or sampling.top_k > 0):
             raise ValueError("return_log_probs requires top_p=1 and top_k<=0 when sampling")
-        repetition_penalty = _checkpoint_repetition_penalty(self.engine.module)
+        if sampling.repetition_penalty is not None and sampling.repetition_penalty <= 0:
+            raise ValueError("repetition_penalty must be positive")
+        repetition_penalty = _repetition_penalty(sampling, self.engine.module)
         if return_log_probs and repetition_penalty != 1.0:
             # The penalty depends on the context and is applied before the
             # log-probs are recorded; a training forward pass cannot reproduce it.
-            logger.warning_once(f"return_log_probs with the checkpoint's repetition_penalty={repetition_penalty}: a "
-                                "training forward pass cannot reproduce the recorded log-probs")
+            logger.warning_once(f"return_log_probs with repetition_penalty={repetition_penalty}: a training forward "
+                                "pass cannot reproduce the recorded log-probs")
 
     def _generate_tokens(self, prompt_ids, prompt_attn, max_new_tokens, sampling, pad_token_id):
         module = self.engine.module
@@ -1029,6 +1033,8 @@ class HybridEngineRollout(RolloutEngine):
         }
         if do_sample:
             generate_kwargs["top_k"] = max(sampling.top_k, 0)
+        if sampling.repetition_penalty is not None:
+            generate_kwargs["repetition_penalty"] = sampling.repetition_penalty
         finish_log_probs = None
         if sampling.return_log_probs:
             from transformers import LogitsProcessorList
@@ -1280,7 +1286,7 @@ class HybridEngineRollout(RolloutEngine):
                     survivor_ids,
                     request_by_id,
                     responses,
-                    _checkpoint_repetition_penalty(module),
+                    _repetition_penalty(sampling, module),
                     select_next_tokens,
                 )
                 stats["decode_steps"] += 1
@@ -1486,7 +1492,7 @@ class HybridEngineRollout(RolloutEngine):
                     decode_ids,
                     request_by_id,
                     responses,
-                    _checkpoint_repetition_penalty(module),
+                    _repetition_penalty(sampling, module),
                     select_next_tokens,
                 )
                 decoded_log_prob_rows = decoded_log_probs_all.split(1, dim=0)
@@ -1908,7 +1914,7 @@ class HybridEngineRollout(RolloutEngine):
             **self._last_logits_kwargs(module),
         )
         last_logits = _penalize_repeats(prefill_output.logits[:, -1, :], prompt_ids,
-                                        _checkpoint_repetition_penalty(module))
+                                        _repetition_penalty(sampling, module))
         tokens, log_probs = _token_selector(sampling)(last_logits)
         return tokens, log_probs, prefill_cache
 
@@ -1927,13 +1933,17 @@ class HybridEngineRollout(RolloutEngine):
     def _hf_sampling_kwargs(sampling):
         """Hugging Face ``generate()`` arguments for ``sampling``; ``temperature <= 0`` is greedy."""
         if sampling.temperature <= 0.0:
-            return {"do_sample": False, "temperature": 1.0, "top_p": 1.0}
-        return {
-            "do_sample": True,
-            "temperature": sampling.temperature,
-            "top_p": sampling.top_p,
-            "top_k": max(sampling.top_k, 0),
-        }
+            kwargs = {"do_sample": False, "temperature": 1.0, "top_p": 1.0}
+        else:
+            kwargs = {
+                "do_sample": True,
+                "temperature": sampling.temperature,
+                "top_p": sampling.top_p,
+                "top_k": max(sampling.top_k, 0),
+            }
+        if sampling.repetition_penalty is not None:
+            kwargs["repetition_penalty"] = sampling.repetition_penalty
+        return kwargs
 
     @staticmethod
     def _prefill_position_ids(attention_mask):
@@ -2283,7 +2293,7 @@ class HybridEngineRollout(RolloutEngine):
             decode_start = torch.full((batch_size, ), prompt_len, dtype=torch.long, device=device)
             prompt_slots = prompt_attn.bool()
         select_next_tokens = _token_selector(sampling)
-        repetition_penalty = _checkpoint_repetition_penalty(module)
+        repetition_penalty = _repetition_penalty(sampling, module)
         # generate() penalizes the sequence so far, prompt included.
         next_token, first_log_probs = select_next_tokens(
             _penalize_repeats(prefill_logits, prompt_ids, repetition_penalty))

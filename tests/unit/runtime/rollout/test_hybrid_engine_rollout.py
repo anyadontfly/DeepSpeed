@@ -921,6 +921,31 @@ def test_continuous_generation_reads_repetition_penalty_from_the_checkpoint():
     assert generate(100.0) != generate(1.0)
 
 
+def test_sampling_repetition_penalty_overrides_the_checkpoint():
+    request = RolloutRequest(samples=[_prompt([5, 6])])
+
+    def generate(checkpoint_repetition_penalty, repetition_penalty):
+        model = _LastTokenModel(_repeat_preferring_logits, checkpoint_repetition_penalty=checkpoint_repetition_penalty)
+        rollout = HybridEngineRollout(SimpleNamespace(module=model), _make_tokenizer())
+        sampling = SamplingConfig(max_new_tokens=3,
+                                  temperature=0,
+                                  continuous_batch_size=1,
+                                  repetition_penalty=repetition_penalty)
+        return rollout.generate(request, sampling).samples[0].tokens
+
+    # 1.0 turns off a checkpoint's penalty, and a set value applies over a checkpoint without one.
+    assert generate(100.0, 1.0) == generate(1.0, None)
+    assert generate(1.0, 100.0) == generate(100.0, None)
+    assert generate(1.0, 100.0) != generate(1.0, None)
+
+
+def test_repetition_penalty_must_be_positive():
+    rollout = HybridEngineRollout(_make_engine(), _make_tokenizer())
+
+    with pytest.raises(ValueError, match="repetition_penalty must be positive"):
+        rollout.generate(_make_request(), SamplingConfig(max_new_tokens=1, repetition_penalty=0.0))
+
+
 @patch("deepspeed.runtime.rollout.hybrid_engine_rollout.logger")
 def test_return_log_probs_warns_about_a_checkpoint_repetition_penalty(mock_logger):
     model = _LastTokenModel(_repeat_preferring_logits, checkpoint_repetition_penalty=1.5)

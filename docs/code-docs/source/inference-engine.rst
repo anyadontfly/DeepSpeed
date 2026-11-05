@@ -115,9 +115,10 @@ single-GPU. Greedy decoding of a single row without log-probs gets a fully
 fused decode step inside the captured graph; otherwise tokens are chosen in
 Python after each replay, so sampling and log-probs work as on the plain graph
 path. The graph path, and continuous batching with or without graphs, apply
-``temperature``, ``top_k`` and ``top_p`` from ``SamplingConfig``, and the
-``repetition_penalty`` from the model's ``generation_config``, in the order
-``generate()`` applies them. ``return_log_probs`` warns about a penalty other
+``temperature``, ``top_k``, ``top_p`` and ``repetition_penalty`` from
+``SamplingConfig`` in the order ``generate()`` applies them. A
+``repetition_penalty`` of ``None`` uses the value in the model's
+``generation_config``, and 1.0 disables the penalty. ``return_log_probs`` warns about a penalty other
 than 1.0, since a training forward pass cannot reproduce those log-probs. On hybrid models (linear-attention layers, e.g. Qwen3.5),
 padded prompts use HF ``generate`` instead of the graph path. Fused projections
 are never applied to layers carrying tensor-parallel collectives.
