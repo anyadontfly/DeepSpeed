@@ -72,7 +72,7 @@ Shared prefill currently requires HybridEngine kernel injection, ZeRO stage 0,
 inference tensor-parallel size 1, an internal KV cache, and a prompt longer than
 one token. It cannot be combined with CUDA graph capture,
 ``release_inference_cache``, or continuous batching
-(``SamplingConfig.continuous_batch_size``). Sampling still happens independently
+(``continuous_batch_size``). Sampling still happens independently
 for every response branch after the shared prompt forward.
 
 Segment-Based Kernel Injection (experimental)
@@ -118,17 +118,19 @@ path. The graph path, and continuous batching with or without graphs, apply
 ``temperature``, ``top_k``, ``top_p`` and ``repetition_penalty`` from
 ``SamplingConfig`` in the order ``generate()`` applies them. A
 ``repetition_penalty`` of ``None`` uses the value in the model's
-``generation_config``, and 1.0 disables the penalty. ``return_log_probs`` warns about a penalty other
-than 1.0, since a training forward pass cannot reproduce those log-probs. On hybrid models (linear-attention layers, e.g. Qwen3.5),
+``generation_config``, and 1.0 disables the penalty. With ``return_log_probs``, ``generate()`` warns about a
+penalty other than 1.0, since a training forward pass cannot reproduce those log-probs. On hybrid models (linear-attention layers, e.g. Qwen3.5),
 padded prompts use HF ``generate`` instead of the graph path. Fused projections
 are never applied to layers carrying tensor-parallel collectives.
 
 Continuous batching (experimental)
 -----------------------------------
 
-Continuous batching is enabled through ``SamplingConfig.continuous_batch_size``
-on the regular ``HybridEngineRollout.generate(request, sampling)`` entry point.
-When unset, generation keeps its existing behavior. When set to a positive
+Continuous batching is enabled through ``continuous_batch_size`` in
+``RolloutConfig`` or ``HybridEngineRolloutConfig``. It sizes the KV cache and
+the captured graph, so it is fixed for the rollout engine rather than passed
+with each ``generate(request, sampling)`` call. When unset, generation keeps
+its existing behavior. When set to a positive
 value, at most that many prompt rows are active at once; completed rows retire
 and pending rows are prefetched into the released slots. The returned
 ``RolloutBatch`` remains in the original ``RolloutRequest`` row order.
