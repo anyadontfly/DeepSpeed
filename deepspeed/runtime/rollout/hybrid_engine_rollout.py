@@ -26,6 +26,7 @@ import torch
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.rollout.base import RolloutBatch, RolloutEngine, RolloutRequest, SamplingConfig
 from deepspeed.runtime.rollout.continuous_batching import ContinuousBatchRequest, ContinuousBatchScheduler
+from deepspeed.runtime.rollout.gqa_decode_attention import gqa_decode_attention
 from deepspeed.utils import logger
 
 
@@ -137,6 +138,12 @@ class HybridEngineRollout(RolloutEngine):
 
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
+        # Grouped-query sdpa models decode with enable_gqa instead of copying the KV heads; see
+        # gqa_decode_attention. The model's attention implementation is restored on return.
+        with gqa_decode_attention(self.engine.module, request.prompt_ids.device):
+            return self._generate(request, sampling)
+
+    def _generate(self, request, sampling):
         if sampling.continuous_batch_size is not None:
             return self._generate_continuous(request, sampling, sampling.continuous_batch_size)
 
@@ -816,7 +823,7 @@ class HybridEngineRollout(RolloutEngine):
     def _continuous_graph_signature(module, max_batch_size, prompt_len, max_cache_len, device, model_dtype):
         parameter_signature = tuple((parameter.data_ptr(), parameter._version) for parameter in module.parameters())
         return (id(module), device.type, device.index, model_dtype, max_batch_size, prompt_len, max_cache_len,
-                parameter_signature)
+                getattr(module.config, "_attn_implementation", None), parameter_signature)
 
     @staticmethod
     def _update_static_causal_attention(static_attention, static_causal_attention):
