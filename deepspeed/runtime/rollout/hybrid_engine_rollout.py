@@ -316,7 +316,8 @@ class HybridEngineRollout(RolloutEngine):
     @torch.no_grad()
     def generate(self, request: RolloutRequest, sampling: SamplingConfig) -> RolloutBatch:
         samples = request.samples
-        if not samples:
+        # Under ZeRO-3 a rank with no prompts still joins the other ranks' parameter gathers, with a placeholder row.
+        if not samples and not self.partitions_weights:
             return RolloutBatch(samples=[])
         self._check_sampling(sampling)
         self._check_parallelism()
@@ -477,7 +478,7 @@ class HybridEngineRollout(RolloutEngine):
         return_log_probs = self.return_log_probs
         pad_token_id = get_pad_token_id(self.tokenizer)
         module = self.engine.module
-        max_prompt_length = max(len(sample.tokens) for sample in trajectories)
+        max_prompt_length = max((len(sample.tokens) for sample in trajectories), default=0)
 
         if self.enable_profiling:
             accelerator = get_accelerator()
@@ -597,7 +598,8 @@ class HybridEngineRollout(RolloutEngine):
                     profile["tool_ms"] += tool_ms
                     profile["post_processing_ms"] += (turn_end - generation_end) * 1000.0 - tool_ms
                     profile["num_generated_tokens"] += int(output_ids.shape[0] * (output_ids.shape[1] - prompt_len))
-                    profile["num_turns"] += 1
+                    # One turn per trajectory in the round, as the records and continuous batching count them.
+                    profile["num_turns"] += len(turn_samples)
                     prefill_ms, decode_ms, num_decodes = (None, None, 0)
                     if forward_profiler is not None:
                         prefill_ms, decode_ms, num_decodes = forward_profiler.get_stage_times()
@@ -1550,37 +1552,21 @@ class HybridEngineRollout(RolloutEngine):
                                   sampling, selector, rows):
         position_ids = self._prefill_position_ids(prompt_attention)
         if getattr(module, "_supports_cache_class", None) is None:
-            pad_token_id = get_pad_token_id(self.tokenizer)
-            sampling_kwargs = self._hf_sampling_kwargs(sampling)
-            generate_kwargs = {}
-            finish_log_probs = None
-            if self.return_log_probs:
-                # As on the static path, the recorder sees the scores after generate()'s repetition penalty.
-                from transformers import LogitsProcessorList
-                processor, finish_log_probs = sampled_log_prob_recorder(sampling_kwargs["temperature"])
-                generate_kwargs["logits_processor"] = LogitsProcessorList([processor])
+            # generate() runs the prefill into a cache of its own choosing. It decodes greedily and without a penalty, so
+            # it draws no random numbers, and the selector picks the first token from the raw logits, with the same
+            # padding-free history as every later step.
             prefill_output = module.generate(
                 prompt_ids,
                 attention_mask=prompt_attention,
                 position_ids=position_ids,
                 max_new_tokens=1,
                 eos_token_id=None,
-                pad_token_id=pad_token_id,
+                pad_token_id=get_pad_token_id(self.tokenizer),
                 return_dict_in_generate=True,
-                **sampling_kwargs,
-                **generate_kwargs,
+                output_logits=True,
+                **self._hf_sampling_kwargs(SamplingConfig(max_new_tokens=1, temperature=0.0, repetition_penalty=1.0)),
             )
-            tokens = prefill_output.sequences[:, -1:]
-            log_probs = finish_log_probs(tokens) if finish_log_probs is not None else None
-            # generate() picked these tokens, so the selector only records them for the decode steps.
-            # The selector needs the vocabulary size only to track a repetition penalty's history.
-            vocab_size = None
-            if selector.repetition_penalty != 1.0:
-                head = module.get_output_embeddings()
-                # A vocabulary-parallel head holds only this rank's rows of the weight, but gathers the full logits.
-                vocab_size = getattr(head, "vocab_size", head.weight.shape[0])
-            selector.start(prompt_ids, prompt_attention, rows, vocab_size=vocab_size)
-            selector.record(tokens, rows)
+            tokens, log_probs = selector.first(prefill_output.logits[0], prompt_ids, prompt_attention, rows)
             return tokens, log_probs, prefill_output.past_key_values
 
         prompt_len = prompt_ids.shape[1]
@@ -1794,7 +1780,8 @@ class HybridEngineRollout(RolloutEngine):
         prompt_slots = prompt_attn_mask.bool()
         selector = _TokenSelector(sampling, get_repetition_penalty(sampling, module), batch_size,
                                   self.return_log_probs)
-        next_token, first_log_probs = selector.first(prefill_logits, prompt_ids)
+        # Padding is not part of a row's context, so the repetition penalty leaves it out.
+        next_token, first_log_probs = selector.first(prefill_logits, prompt_ids, prompt_attn_mask)
         log_probs = [first_log_probs]
 
         output_ids = [prompt_ids, next_token]

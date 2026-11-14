@@ -71,8 +71,11 @@ without graphs, apply ``temperature``, ``top_k``, ``top_p`` and
 ``repetition_penalty`` from ``SamplingConfig`` in the order ``generate()``
 applies them, so every path samples from the same distribution. A
 ``repetition_penalty`` of ``None`` uses the value in the model's
-``generation_config``, and 1.0 disables the penalty. Other
-``generation_config`` settings are not applied on these paths. With
+``generation_config``, and 1.0 disables the penalty. On these paths the
+penalty leaves out the left padding of a batch, so a record decodes as it would
+alone; static batching without graph capture uses ``generate()``'s own penalty,
+which also counts the padding. Other ``generation_config`` settings are not
+applied on these paths. With
 ``return_log_probs``, ``generate()`` warns about a penalty other than 1.0,
 since a training forward pass cannot reproduce those log-probs.
 

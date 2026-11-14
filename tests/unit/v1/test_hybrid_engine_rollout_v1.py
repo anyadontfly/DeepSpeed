@@ -493,6 +493,47 @@ def test_decode_paths_match_hf_generate(temperature, top_k, top_p, repetition_pe
     assert [sample.tokens for sample in output.samples] == expected.tolist()
 
 
+@pytest.mark.parametrize("use_graph_capture, continuous_batch_size", [(True, None), (True, 4), (False, 4)])
+def test_repetition_penalty_leaves_left_padding_out(use_graph_capture, continuous_batch_size):
+    """A left-padded row must decode as it would alone, even when its pad id is the token it would pick next."""
+    accelerator = get_accelerator()
+    if not accelerator.is_available() or accelerator.create_graph() is None:
+        pytest.skip("requires graph capture")
+    device = torch.device(accelerator.device_name())
+    model = _peaked_llama(device)
+    # Strong enough that a penalized pick loses to the runner-up even on this model's peaked logits.
+    model.generation_config.repetition_penalty = 5.0
+    prompts = [[5, 9, 13, 17, 21, 25], [7, 11], [30, 31, 32], [40, 41, 42, 43]]
+
+    def alone(prompt):
+        with torch.no_grad():
+            return model.generate(torch.tensor([prompt], device=device),
+                                  max_new_tokens=8,
+                                  do_sample=False,
+                                  eos_token_id=None,
+                                  pad_token_id=0)[0].tolist()
+
+    expected = [alone(prompt) for prompt in prompts]
+    # The pad is the first token the second row picks alone, so counting the padding would penalize that pick.
+    pad = expected[1][len(prompts[1])]
+    assert all(pad not in prompt for prompt in prompts)
+    width = max(len(prompt) for prompt in prompts)
+    samples = [
+        RolloutRecord(tokens=[pad] * (width - len(prompt)) + prompt,
+                      attention_mask=[0] * (width - len(prompt)) + [1] * len(prompt)) for prompt in prompts
+    ]
+    tokenizer = SimpleNamespace(pad_token_id=pad, eos_token_id=-1, decode=lambda ids, **_kwargs: "")
+    rollout = HybridEngineRollout(_engine_for(model),
+                                  tokenizer,
+                                  cfg=HybridEngineRolloutConfig(use_graph_capture=use_graph_capture,
+                                                                continuous_batch_size=continuous_batch_size))
+
+    records = rollout.generate(RolloutRequest(samples=samples), SamplingConfig(max_new_tokens=8,
+                                                                               temperature=0)).samples
+
+    assert [[token for token, keep in zip(r.tokens, r.attention_mask) if keep] for r in records] == expected
+
+
 @pytest.mark.parametrize("attn_implementation", ["eager", "sdpa"])
 def test_static_graph_matches_native_llama_generation(attn_implementation):
     accelerator = get_accelerator()
@@ -1015,9 +1056,10 @@ class TestDataParallelRollout(DistributedTest):
         after = check_against_hf_generate()
         assert after != before
 
-    @pytest.mark.parametrize("over_cap", [False, True])
-    def test_zero3_ranks_stay_in_step_under_max_out_tokens(self, over_cap):
-        """``max_out_tokens`` gives each rank a different budget, or none, and ZeRO-3 ranks must still agree."""
+    @pytest.mark.parametrize("second_rank", ["short_budget", "over_cap", "empty"])
+    def test_zero3_ranks_stay_in_step_under_max_out_tokens(self, second_rank):
+        """``max_out_tokens`` gives each rank a different budget, or none, and ZeRO-3 ranks must still agree, also
+        when a rank has no prompts."""
         from transformers import AutoModelForCausalLM, Qwen3Config
 
         config = Qwen3Config(vocab_size=64,
@@ -1050,18 +1092,22 @@ class TestDataParallelRollout(DistributedTest):
         device = get_accelerator().current_device_name()
         tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=None, decode=lambda ids, **_kwargs: "")
         rollout = HybridEngineRollout(engine, tokenizer, HybridEngineRolloutConfig())
-        # Rank 0 has the budget for every token; rank 1 for two, or with over_cap for none.
+        # Rank 0 has the budget for every token; rank 1 for two, for none, or no prompts at all.
         if dist.get_rank() == 0:
             prompts = [[3, 7, 21, 30], [5, 9, 12]]
+        elif second_rank == "empty":
+            prompts = []
         else:
-            length = 13 if over_cap else 10
+            length = 13 if second_rank == "over_cap" else 10
             prompts = [list(range(1, length + 1)), list(range(2, length + 2))]
 
         records = rollout.generate(
             RolloutRequest(samples=[RolloutRecord(tokens=p, attention_mask=[1] * len(p)) for p in prompts]),
             SamplingConfig(max_new_tokens=max_new_tokens, temperature=0.0)).samples
 
-        for prompt, record in zip(prompts, records):
+        assert len(records) == len(prompts)
+        # The reference also gathers parameters, so a rank without prompts runs it on stand-ins to stay in step.
+        for index, prompt in enumerate(prompts or [[1, 2, 3], [4, 5, 6]]):
             budget = max(min(max_new_tokens, max_out_tokens - len(prompt)), 0)
             # Every rank generates the same number of tokens here, so the reference stays in step too.
             with torch.no_grad():
@@ -1069,6 +1115,9 @@ class TestDataParallelRollout(DistributedTest):
                                            max_new_tokens=max_new_tokens,
                                            do_sample=False,
                                            pad_token_id=0)
+            if not prompts:
+                continue
+            record = records[index]
             real = [token for token, keep in zip(record.tokens, record.attention_mask) if keep]
             assert real == expected[0, :len(prompt) + budget].tolist()
             assert record.status == RolloutRecord.Status.TRUNCATED

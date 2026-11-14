@@ -107,7 +107,9 @@ def grpo_policy_loss(log_probs: torch.Tensor,
 
     mask = response_mask.to(dtype=log_probs.dtype)
     advantages = advantages.to(dtype=log_probs.dtype).unsqueeze(1)
-    ratio = torch.exp(log_probs - old_log_probs)
+    # Masked positions can hold any value, and exp() of a large one would turn the masked sums into inf * 0 = NaN.
+    valid = response_mask.bool()
+    ratio = torch.exp(torch.where(valid, log_probs - old_log_probs, torch.zeros_like(log_probs)))
     unclipped = -advantages * ratio
     clipped = -advantages * ratio.clamp(1.0 - clip_low, 1.0 + clip_high)
     token_loss = torch.maximum(unclipped, clipped)
@@ -115,7 +117,7 @@ def grpo_policy_loss(log_probs: torch.Tensor,
     kl = None
     if ref_log_probs is not None:
         # The k3 estimator (Schulman, "Approximating KL Divergence") is non-negative and low-variance.
-        log_ratio = ref_log_probs - log_probs
+        log_ratio = torch.where(valid, ref_log_probs - log_probs, torch.zeros_like(log_probs))
         token_kl = torch.exp(log_ratio) - log_ratio - 1.0
         token_loss = token_loss + kl_coef * token_kl
 

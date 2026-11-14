@@ -397,6 +397,27 @@ def test_grpo_policy_loss_adds_the_k3_kl_penalty():
     assert output.loss.item() == pytest.approx(0.1 * token_kl / 2)
 
 
+def test_grpo_policy_loss_ignores_extreme_values_at_masked_positions():
+    # Prompt, tool and pad positions are masked out, and whatever they hold must not reach the loss or its gradient.
+    log_probs = torch.zeros(1, 2, requires_grad=True)
+    old_log_probs = torch.tensor([[0.0, -1e4]])
+    ref_log_probs = torch.tensor([[0.0, 1e4]])
+    response_mask = torch.tensor([[True, False]])
+
+    output = grpo_policy_loss(log_probs,
+                              old_log_probs,
+                              torch.ones(1),
+                              response_mask,
+                              ref_log_probs=ref_log_probs,
+                              kl_coef=0.1)
+    output.loss.backward()
+
+    # Only the first token counts: ratio 1 and KL 0, so the loss is -A.
+    assert output.loss.item() == pytest.approx(-1.0)
+    assert output.kl.item() == 0.0
+    assert log_probs.grad.tolist() == [[-1.0, 0.0]]
+
+
 def test_grpo_policy_loss_of_an_empty_response_is_zero():
     log_probs, old_log_probs, advantages, _ = _ppo_case()
 

@@ -10,6 +10,7 @@ only when CUDA is available.
 
 import asyncio
 import gc
+import inspect
 import weakref
 from types import MethodType, SimpleNamespace
 from contextlib import contextmanager, nullcontext
@@ -1089,18 +1090,20 @@ def test_global_eos_counts_a_row_past_its_budget_as_finished():
     assert placeholder(torch.tensor([[0, 9]]), scores=None) is True
 
 
-def test_zero3_rank_with_no_budget_left_joins_with_a_finished_placeholder_row():
+# A prompt that already fills max_out_tokens, or no prompt at all: either way this rank has nothing to generate, and
+# returning early would leave the other ranks waiting in ZeRO-3's parameter gathers.
+@pytest.mark.parametrize("prompts", [[[10, 11]], []], ids=["over_cap", "empty"])
+def test_zero3_rank_with_nothing_to_generate_joins_with_a_finished_placeholder_row(prompts):
     engine = _make_engine(max_out_tokens=2)
     engine.zero_optimization_partition_weights.return_value = True
     engine.module.parameters.side_effect = lambda: iter([torch.nn.Parameter(torch.zeros(1))])
     engine.module.generate.return_value = torch.tensor([[0, 9]])
     rollout = HybridEngineRollout(engine, _make_tokenizer())
 
-    # The prompt already fills max_out_tokens, so this rank has nothing to generate.
-    result = rollout.generate(RolloutRequest(samples=[_prompt([10, 11])]),
+    result = rollout.generate(RolloutRequest(samples=[_prompt(prompt) for prompt in prompts]),
                               SamplingConfig(max_new_tokens=4, max_new_tokens_per_turn=3, temperature=0))
 
-    assert result.samples[0].status == RolloutRecord.Status.TRUNCATED
+    assert [sample.status for sample in result.samples] == [RolloutRecord.Status.TRUNCATED] * len(prompts)
     kwargs = engine.module.generate.call_args.kwargs
     assert engine.module.generate.call_args.args[0].shape == (1, 1)
     # Ranks decode up to the same configured cap, whatever their own budgets.
@@ -1348,6 +1351,8 @@ def test_generate_records_profile_when_enabled(mock_get_accelerator, mock_perf_c
     assert profile["post_processing_ms"] == pytest.approx(2.0)
     assert profile["total_ms"] == pytest.approx(13.0)
     assert profile["num_generated_tokens"] == 8
+    # One turn for each of the four trajectories, as continuous batching counts them.
+    assert profile["num_turns"] == 4
     assert profile["tokens_per_second"] == pytest.approx(8 / 0.013)
     assert profile["batch_size"] == 2
     assert profile["num_samples_per_prompt"] == 2
@@ -1940,6 +1945,16 @@ def test_rejects_hybrid_engine_inference_tensor_parallelism():
 
     with pytest.raises(ValueError, match="does not support hybrid engine inference tensor parallelism"):
         rollout.generate(_make_request(), _make_sampling())
+
+
+def test_every_comm_backend_accepts_a_backend_for_new_group():
+    # The AutoTP rollout asks for a Gloo group through dist.new_group(ranks, backend="gloo"); a backend whose override
+    # drops the keyword raises TypeError there. The CCL backend cannot run here, so its signature is what is checked.
+    from deepspeed.comm.ccl import CCLBackend
+    from deepspeed.comm.torch import TorchBackend
+
+    for backend in (TorchBackend, CCLBackend):
+        assert "backend" in inspect.signature(backend.new_group).parameters, backend.__name__
 
 
 class _EchoTextTool(Tool):
